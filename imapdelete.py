@@ -88,7 +88,14 @@ Per ulteriori informazioni su un parametro specifico, digita il nome del paramet
 
 
 
-
+def show_grouped_subjects(filtered_msgs):
+    subject_count = {}
+    for _, subject in filtered_msgs:
+        subject_count[subject] = subject_count.get(subject, 0) + 1
+    
+    print(f"\nSoggetti dei messaggi trovati (totale: {len(filtered_msgs)}):")
+    for subject, count in sorted(subject_count.items(), key=lambda x: x[1], reverse=True):
+        print(f"- {subject} ({count} messaggi)")
 
 
 def create_progress_bar(total, current, matching, non_matching):
@@ -281,8 +288,7 @@ def main():
 
     show_subjects = input('Vuoi visualizzare l\'elenco dei soggetti dei messaggi? (s/n): ')
     if show_subjects.lower() == 's':
-        for idx, (msg_id, subject) in enumerate(filtered_msgs, 1):
-            print(f'{idx}. {subject}')
+        show_grouped_subjects(filtered_msgs)
 
     confirm_delete = input('Vuoi procedere con la cancellazione dei messaggi? (s/n): ')
     if confirm_delete.lower() != 's':
