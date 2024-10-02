@@ -311,35 +311,63 @@ def main():
     total_msgs = len(msg_ids)
     filtered_msgs = []
     non_matching = 0
+
     for idx, msg_id in enumerate(msg_ids, 1):
-        res, msg_data = imap.fetch(msg_id, '(RFC822.HEADER)')
-        if res != 'OK':
+        try:
+            res, msg_data = imap.fetch(msg_id, '(RFC822.HEADER)')
+            if res != 'OK' or not msg_data or msg_data[0] is None:
+                print(f"\nWarning: Impossibile recuperare l'header completo per il messaggio ID {msg_id.decode()} (Indice: {idx}/{total_msgs})")
+                # Tentiamo di recuperare gli header disponibili
+                try:
+                    res, msg_data = imap.fetch(msg_id, '(BODY[HEADER.FIELDS (FROM TO SUBJECT DATE)])')
+                    if res == 'OK' and msg_data and msg_data[0] is not None:
+                        print("Header disponibili:")
+                        header_data = msg_data[0][1].decode('utf-8', errors='ignore')
+                        print(header_data)
+                    else:
+                        print("Impossibile recuperare gli header di base.")
+                except Exception as e:
+                    print(f"Errore nel tentativo di recuperare gli header di base: {str(e)}")
+                continue
+
+            header_data = msg_data[0][1]
+            if header_data is None:
+                print(f"\nWarning: Dati dell'header mancanti per il messaggio ID {msg_id}")
+                continue
+
+            try:
+                header_data = header_data.decode('utf-8', errors='ignore')
+            except AttributeError:
+                print(f"\nWarning: Dati dell'header mancanti per il messaggio ID {msg_id.decode()} (Indice: {idx}/{total_msgs})")
+                continue
+
+            # Verifica le condizioni AND
+            and_match = all(re.search(regex, get_header_value(header_data, header), re.IGNORECASE)
+                            for header, regex in and_headers)
+
+            # Verifica le condizioni OR
+            or_match = any(re.search(regex, get_header_value(header_data, header), re.IGNORECASE)
+                        for header, regex in or_headers) if or_headers else True
+
+            subject = get_header_value(header_data, 'Subject')
+
+            if (and_match and or_match) and (not args.regex or re.search(args.regex, subject, re.IGNORECASE)):
+                filtered_msgs.append((msg_id, subject))
+            else:
+                non_matching += 1
+
+        except Exception as e:
+            print(f"\nErrore durante l'elaborazione del messaggio ID {msg_id.decode()} (Indice: {idx}/{total_msgs}): {str(e)}")
             continue
-        
-        header_data = msg_data[0][1].decode('utf-8', errors='ignore')
-        
-        # Verifica le condizioni AND
-        and_match = all(re.search(regex, get_header_value(header_data, header), re.IGNORECASE)
-                        for header, regex in and_headers)
-        
-        # Verifica le condizioni OR
-        or_match = any(re.search(regex, get_header_value(header_data, header), re.IGNORECASE)
-                       for header, regex in or_headers) if or_headers else True
 
-        subject = get_header_value(header_data, 'Subject')
-
-        if (and_match and or_match) and (not args.regex or re.search(args.regex, subject, re.IGNORECASE)):
-            filtered_msgs.append((msg_id, subject))
-        else:
-            non_matching += 1
-        
         # Aggiorna la barra di avanzamento
         matching = len(filtered_msgs)
         progress_bar = create_progress_bar(total_msgs, idx, matching, non_matching)
         print(f'\r{progress_bar}', end='', flush=True)
-
+        # Fine ciclo for
+        
+        
     print('\n')  # Nuova linea dopo la barra di avanzamento
-
     num_msgs = len(filtered_msgs)
     print(f'Numero di messaggi trovati: {num_msgs}')
 
