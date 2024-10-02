@@ -28,6 +28,8 @@ import getpass
 import sys
 from datetime import datetime
 import shutil
+import email
+from email.header import decode_header
 
 def print_help():
     """
@@ -49,6 +51,9 @@ Questo programma ti permette di gestire le tue email su un server IMAP. Ecco i p
 
 4. Cancellare definitivamente i messaggi (usa con cautela):
    python imap_manager.py -u username@example.com -s imap.example.com -f "INBOX" -d "01/01/2023-31/12/2023" -e "oggetto da cercare"
+   
+5. Cercare messaggi con criteri specifici negli header:
+   python imap_manager.py -u username@example.com -s imap.example.com -f "INBOX" -a "From" "example\.com$" -o "X-Spam-Flag" "YES"
 
 Parametri:
 -u: Username per l'accesso IMAP
@@ -59,6 +64,8 @@ Parametri:
 -d: Intervallo di date per la ricerca (formato: "gg/mm/aaaa-gg/mm/aaaa")
 -e: Cancella definitivamente i messaggi invece di spostarli nel cestino
 [regex]: Espressione regolare opzionale per filtrare i messaggi per oggetto
+-a, --and-header: Ricerca AND nell'header specificato usando la regex fornita (può essere usato più volte)
+-o, --or-header: Ricerca OR nell'header specificato usando la regex fornita (può essere usato più volte)
 
 Per ulteriori informazioni su un parametro specifico, digita il nome del parametro (es. '-u'):
 """)
@@ -86,6 +93,11 @@ Per ulteriori informazioni su un parametro specifico, digita il nome del paramet
         print("\nInserisci un altro parametro o 'q' per uscire:")
 
 
+def decode_mime_words(s):
+    return ''.join(
+        word.decode(encoding or 'utf8') if isinstance(word, bytes) else word
+        for word, encoding in decode_header(s)
+    )
 
 
 
@@ -167,14 +179,18 @@ def create_progress_bar(total, current, matching, non_matching):
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Script IMAP per gestione messaggi.')
-    parser.add_argument('-l', action='store_true', help='Elenca le cartelle IMAP disponibili.')
-    parser.add_argument('-f', metavar='NOMECARTELLA', help='Nome della cartella IMAP da selezionare.')
-    parser.add_argument('-s', metavar='SERVER[:PORTA]', required=True, help='Server IMAP e porta (opzionale).')
-    parser.add_argument('-u', metavar='USERNAME', required=True, help='Username per l\'autenticazione.')
-    parser.add_argument('-p', metavar='PASSWORD', nargs='?', help='Password per l\'autenticazione.')
-    parser.add_argument('-d', metavar='INIZIO-FINE', help='Intervallo di date nel formato dd/mm/yyyy-dd/mm/yyyy.')
-    parser.add_argument('-e', action='store_true', help='Cancella definitivamente i messaggi.')
+    parser.add_argument('-l', '--list', action='store_true', help='Elenca le cartelle IMAP disponibili.')
+    parser.add_argument('-f', '--folder', metavar='NOMECARTELLA', help='Nome della cartella IMAP da selezionare.')
+    parser.add_argument('-s', '--server', metavar='SERVER[:PORTA]', required=True, help='Server IMAP e porta (opzionale).')
+    parser.add_argument('-u', '--user', metavar='USERNAME', required=True, help='Username per l\'autenticazione.')
+    parser.add_argument('-p', '--password', metavar='PASSWORD', nargs='?', help='Password per l\'autenticazione.')
+    parser.add_argument('-d', '--datascope', metavar='INIZIO-FINE', help='Intervallo di date nel formato dd/mm/yyyy-dd/mm/yyyy.')
+    parser.add_argument('-e', '--expunge', action='store_true', help='Cancella definitivamente i messaggi.')
     parser.add_argument('regex', nargs='?', help='Espressione regolare per filtrare i soggetti dei messaggi.')
+    parser.add_argument('-a', '--and-header', action='append', nargs=2, metavar=('HEADER', 'REGEX'),
+                        help='Ricerca AND nell\'header specificato usando la regex fornita')
+    parser.add_argument('-o', '--or-header', action='append', nargs=2, metavar=('HEADER', 'REGEX'),
+                        help='Ricerca OR nell\'header specificato usando la regex fornita')
     return parser.parse_args()
 
 def connect_imap(server, username, password):
@@ -217,25 +233,36 @@ def get_date_range(date_range_str):
     except ValueError:
         print('Formato delle date non valido. Utilizzare dd/mm/yyyy-dd/mm/yyyy.')
         sys.exit(1)
+        
+def get_header_value(header_data, header_name):
+    match = re.search(f'{header_name}: (.*)', header_data, re.IGNORECASE | re.MULTILINE)
+    if match:
+        return decode_mime_words(match.group(1).strip())
+    return ''
 
 def main():
+    
+    # Parse arguments
     args = parse_args()
 
-    if not args.p:
-        args.p = getpass.getpass('Inserisci la password: ')
+    if not args.password:
+        args.password = getpass.getpass('Inserisci la password: ')
+        
+    and_headers = args.and_header or []
+    or_headers = args.or_header or []
 
-    imap = connect_imap(args.s, args.u, args.p)
+    imap = connect_imap(args.server, args.user, args.password)
 
-    if args.l:
+    if args.list:
         list_folders(imap)
         imap.logout()
         sys.exit(0)
 
-    if not args.f:
+    if not args.folder:
         print('Devi specificare una cartella con il parametro -f.')
         sys.exit(1)
 
-    folder_name = args.f.replace('"', '') # gestisce caratteri speciali nel nome folder
+    folder_name = args.folder.replace('"', '') # gestisce caratteri speciali nel nome folder
     try:
         res, data = imap.select(folder_name)
     except imaplib.IMAP4.error as e:
@@ -257,8 +284,8 @@ def main():
 
     search_criteria = []
 
-    if args.d:
-        start_date, end_date = get_date_range(args.d)
+    if args.datascope:
+        start_date, end_date = get_date_range(args.datascope)
         start_str = start_date.strftime('%d-%b-%Y')
         end_str = end_date.strftime('%d-%b-%Y')
         search_criteria.append(f'SINCE {start_str}')
@@ -285,26 +312,27 @@ def main():
     filtered_msgs = []
     non_matching = 0
     for idx, msg_id in enumerate(msg_ids, 1):
-        res, msg_data = imap.fetch(msg_id, '(BODY[HEADER.FIELDS (SUBJECT)])')
+        res, msg_data = imap.fetch(msg_id, '(RFC822.HEADER)')
         if res != 'OK':
             continue
+        
+        header_data = msg_data[0][1].decode('utf-8', errors='ignore')
+        
+        # Verifica le condizioni AND
+        and_match = all(re.search(regex, get_header_value(header_data, header), re.IGNORECASE)
+                        for header, regex in and_headers)
+        
+        # Verifica le condizioni OR
+        or_match = any(re.search(regex, get_header_value(header_data, header), re.IGNORECASE)
+                       for header, regex in or_headers) if or_headers else True
 
-        subject = ''
-        for response_part in msg_data:
-            if isinstance(response_part, tuple):
-                header_data = response_part[1].decode('utf-8', errors='ignore')
-                match = re.search(r'Subject: (.*)', header_data, re.IGNORECASE)
-                if match:
-                    subject = match.group(1).strip()
+        subject = get_header_value(header_data, 'Subject')
 
-        if args.regex:
-            if re.search(args.regex, subject, re.IGNORECASE):
-                filtered_msgs.append((msg_id, subject))
-            else:
-                non_matching += 1
-        else:
+        if (and_match and or_match) and (not args.regex or re.search(args.regex, subject, re.IGNORECASE)):
             filtered_msgs.append((msg_id, subject))
-
+        else:
+            non_matching += 1
+        
         # Aggiorna la barra di avanzamento
         matching = len(filtered_msgs)
         progress_bar = create_progress_bar(total_msgs, idx, matching, non_matching)
@@ -332,7 +360,7 @@ def main():
         total_msgs = len(messages_to_delete)
         print('Cancellazione in corso...')
         for idx, msg_id in enumerate(messages_to_delete, 1):
-            if args.e:
+            if args.expunge:
                 # Cancella definitivamente
                 imap.store(msg_id, '+FLAGS', r'(\Deleted)')
             else:
