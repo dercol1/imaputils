@@ -88,14 +88,48 @@ Per ulteriori informazioni su un parametro specifico, digita il nome del paramet
 
 
 
-def show_grouped_subjects(filtered_msgs):
+
+
+def show_grouped_subjects_and_select(filtered_msgs):
     subject_count = {}
-    for _, subject in filtered_msgs:
-        subject_count[subject] = subject_count.get(subject, 0) + 1
+    for msg_id, subject in filtered_msgs:
+        if subject not in subject_count:
+            subject_count[subject] = {'count': 0, 'ids': []}
+        subject_count[subject]['count'] += 1
+        subject_count[subject]['ids'].append(msg_id)
     
     print(f"\nSoggetti dei messaggi trovati (totale: {len(filtered_msgs)}):")
-    for subject, count in sorted(subject_count.items(), key=lambda x: x[1], reverse=True):
-        print(f"- {subject} ({count} messaggi)")
+    subjects_list = sorted(subject_count.items(), key=lambda x: x[1]['count'], reverse=True)
+    for i, (subject, data) in enumerate(subjects_list, 1):
+        print(f"{i}. {subject} ({data['count']} messaggi)")
+    
+    selected_groups = []
+    while True:
+        choice = input("\nInserisci i numeri dei gruppi da cancellare (separati da virgola), 'a' per tutti, o 'n' per nessuno: ").lower()
+        if choice == 'n':
+            break
+        elif choice == 'a':
+            selected_groups = list(range(1, len(subjects_list) + 1))
+            break
+        else:
+            try:
+                selected_groups = [int(x.strip()) for x in choice.split(',') if x.strip()]
+                if all(1 <= x <= len(subjects_list) for x in selected_groups):
+                    break
+                else:
+                    print("Alcuni numeri non sono validi. Riprova.")
+            except ValueError:
+                print("Input non valido. Inserisci numeri separati da virgola, 'a' o 'n'.")
+    
+    messages_to_delete = []
+    for i in selected_groups:
+        subject, data = subjects_list[i-1]
+        messages_to_delete.extend(data['ids'])
+        print(f"Selezionato per la cancellazione: {subject} ({data['count']} messaggi)")
+    
+    return messages_to_delete
+
+
 
 
 def create_progress_bar(total, current, matching, non_matching):
@@ -286,32 +320,34 @@ def main():
         imap.logout()
         sys.exit(0)
 
-    show_subjects = input('Vuoi visualizzare l\'elenco dei soggetti dei messaggi? (s/n): ')
-    if show_subjects.lower() == 's':
-        show_grouped_subjects(filtered_msgs)
+    messages_to_delete = show_grouped_subjects_and_select(filtered_msgs)
 
-    confirm_delete = input('Vuoi procedere con la cancellazione dei messaggi? (s/n): ')
-    if confirm_delete.lower() != 's':
-        print('Operazione annullata.')
-        imap.logout()
-        sys.exit(0)
+    if messages_to_delete:
+        confirm_delete = input(f"Vuoi procedere con la cancellazione di {len(messages_to_delete)} messaggi? (s/n): ")
+        if confirm_delete.lower() != 's':
+            print('Operazione annullata.')
+            imap.logout()
+            sys.exit(0)
 
-    total_msgs = len(filtered_msgs)
-    print('Cancellazione in corso...')
-    for idx, (msg_id, _) in enumerate(filtered_msgs, 1):
-        if args.e:
-            # Cancella definitivamente
-            imap.store(msg_id, '+FLAGS', r'(\Deleted)')
-        else:
-            # Sposta nel Cestino
-            res = imap.copy(msg_id, 'Trash')
-            if res[0] == 'OK':
+        total_msgs = len(messages_to_delete)
+        print('Cancellazione in corso...')
+        for idx, msg_id in enumerate(messages_to_delete, 1):
+            if args.e:
+                # Cancella definitivamente
                 imap.store(msg_id, '+FLAGS', r'(\Deleted)')
-        if idx % 10 == 0 or idx == total_msgs:
-            print(f'{idx}/{total_msgs} messaggi elaborati.')
+            else:
+                # Sposta nel Cestino
+                res = imap.copy(msg_id, 'Trash')
+                if res[0] == 'OK':
+                    imap.store(msg_id, '+FLAGS', r'(\Deleted)')
+            if idx % 10 == 0 or idx == total_msgs:
+                print(f'{idx}/{total_msgs} messaggi elaborati.')
 
-    imap.expunge()
-    print('Cancellazione completata.')
+        imap.expunge()
+        print('Cancellazione completata.')
+    else:
+        print('Nessun messaggio cancellato.')
+        
     imap.logout()
 
 if __name__ == "__main__":
