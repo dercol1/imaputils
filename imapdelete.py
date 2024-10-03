@@ -13,6 +13,9 @@ Funzionalità principali:
 - Cancellare o spostare nel cestino i messaggi selezionati
 - Visualizzare un'anteprima dei messaggi prima della cancellazione
 - Mostrare una barra di avanzamento durante la ricerca e la cancellazione
+- Archiviare i messaggi in una struttura di cartelle IMAP
+- Archiviare i messaggi in una struttura di cartelle locali
+- Modalità di debug per la risoluzione dei problemi
 
 Autore: Diego Ercolani
 Data: 2/10/2024 ultima modifica 2/10/2024
@@ -30,6 +33,9 @@ from datetime import datetime
 import shutil
 import email
 from email.header import decode_header
+from email import message_from_bytes
+import os
+import time
 
 def print_help():
     """
@@ -54,6 +60,12 @@ Questo programma ti permette di gestire le tue email su un server IMAP. Ecco i p
    
 5. Cercare messaggi con criteri specifici negli header:
    python imap_manager.py -u username@example.com -s imap.example.com -f "INBOX" -a "From" "example\.com$" -o "X-Spam-Flag" "YES"
+   
+6. Archiviare i messaggi in una struttura di cartelle IMAP:
+   python imap_manager.py -u username@example.com -s imap.example.com -f "INBOX" --archive "Archive" "oggetto da cercare"
+
+7. Archiviare i messaggi in una struttura di cartelle locali:
+   python imap_manager.py -u username@example.com -s imap.example.com -f "INBOX" --archive-to-disk "/path/to/archive" "oggetto da cercare"
 
 Parametri:
 -u: Username per l'accesso IMAP
@@ -66,6 +78,10 @@ Parametri:
 [regex]: Espressione regolare opzionale per filtrare i messaggi per oggetto
 -a, --and-header: Ricerca AND nell'header specificato usando la regex fornita (può essere usato più volte)
 -o, --or-header: Ricerca OR nell'header specificato usando la regex fornita (può essere usato più volte)
+
+--archive: Specifica la cartella IMAP di destinazione per l'archiviazione dei messaggi
+--archive-to-disk: Specifica la cartella locale di destinazione per l'archiviazione dei messaggi
+--debug: Abilita i messaggi di debug
 
 Per ulteriori informazioni su un parametro specifico, digita il nome del parametro (es. '-u'):
 """)
@@ -88,9 +104,124 @@ Per ulteriori informazioni su un parametro specifico, digita il nome del paramet
             print("-d: Imposta l'intervallo di date per la ricerca dei messaggi (formato: 'gg/mm/aaaa-gg/mm/aaaa').")
         elif user_input == '-e':
             print("-e: Se presente, i messaggi verranno cancellati definitivamente invece di essere spostati nel cestino.")
+        elif user_input == '--archive':
+            print("--archive: Specifica la cartella IMAP di destinazione per l'archiviazione dei messaggi. "
+                  "I messaggi verranno archiviati in una struttura di cartelle organizzata per anno e mese. "
+                  "Con questa opzione, i messaggi vengono spostati e non copiati nel cestino.")
+        elif user_input == '--archive-to-disk':
+            print("--archive-to-disk: Specifica la cartella locale di destinazione per l'archiviazione dei messaggi. "
+                  "I messaggi verranno archiviati in una struttura di cartelle locale organizzata per anno e mese. "
+                  "Con questa opzione, i messaggi vengono archiviati localmente e spostati nel cestino, a meno che non sia presente il flag -e.")
+        elif user_input == '--debug':
+            print("--debug: "
+                  "Attiva modalità debug. "
+                  )
         else:
-            print("Parametro non riconosciuto. Prova con -u, -s, -p, -l, -f, -d, o -e.")
+            print("Parametro non riconosciuto. Prova con -u, -s, -p, -l, -f, -d, -e, --archive, o --archive-to-disk.")
         print("\nInserisci un altro parametro o 'q' per uscire:")
+
+def create_imap_folder(imap, folder_name, user, debug=False):
+    if debug:
+        print(f"DEBUG: Tentativo di creare la cartella: {folder_name}")
+    try:
+        # Rimuovi le virgolette dal nome della cartella
+        folder_name = folder_name.strip('"')
+        if debug:
+            print(f"DEBUG: Nome cartella senza virgolette: {folder_name}")
+
+        # Dividi il percorso della cartella in componenti
+        folder_parts = folder_name.split('/')
+        if debug:
+            print(f"DEBUG: Componenti del percorso: {folder_parts}")
+
+        # Crea ogni livello della cartella se non esiste
+        current_path = ''
+        for part in folder_parts:
+            if current_path:
+                current_path += '/'
+            current_path += part
+            if debug:
+                print(f"DEBUG: Verifica/creazione del percorso: {current_path}")
+
+            # Verifica se la cartella esiste
+            res, folders = imap.list(f'"{current_path}"')
+            if debug:
+                print(f"DEBUG: Risultato list per {current_path}: res={res}, folders={folders}")
+
+            # Gestisci il caso in cui 'folders' è None o [None]
+            if res != 'OK' or not folders or folders == [None]:
+                if debug:
+                    print(f"DEBUG: La cartella {current_path} non esiste, tentativo di creazione...")
+                # Se la cartella non esiste, la creiamo
+                res, data = imap.create(f'"{current_path}"')
+                if debug:
+                    print(f"DEBUG: Risultato create per {current_path}: res={res}, data={data}")
+                if res != 'OK':
+                    print(f"Errore nella creazione della cartella {current_path}")
+                    return False
+            else:
+                if debug:
+                    print(f"DEBUG: La cartella {current_path} esiste già")
+                # Verifica se la cartella ha il flag \\HasChildren
+                # Filtra eventuali valori None in 'folders'
+                valid_folders = [folder for folder in folders if folder is not None]
+                if not any(b'\\HasChildren' in folder for folder in valid_folders):
+                    if debug:
+                        print(f"DEBUG: La cartella {current_path} non ha il flag \\HasChildren, aggiornamento...")
+                    # Aggiorna i flag della cartella (se necessario)
+                    # Nota: potrebbe essere necessario un comando specifico per aggiornare i flag
+    except imaplib.IMAP4.error as e:
+        print(f"Errore IMAP durante la creazione della cartella {folder_name}: {str(e)}")
+        return False
+    if debug:
+        print(f"DEBUG: Creazione della cartella {folder_name} completata con successo")
+    return True
+
+
+def archive_message_imap(imap, msg_id, dest_folder, source_folder, user, debug=False):
+    if debug:
+        print(f"DEBUG: Inizio archiviazione del messaggio {msg_id}")
+    res, msg_data = imap.fetch(msg_id, '(RFC822)')
+    if res != 'OK':
+        print(f"Errore nel recupero del messaggio {msg_id}")
+        return False
+
+    email_body = msg_data[0][1]
+    email_message = message_from_bytes(email_body)
+    date_tuple = email.utils.parsedate_tz(email_message['Date'])
+    
+    source_folder_name = os.path.basename(source_folder.strip('"'))
+    if debug:
+        print(f"DEBUG: Nome cartella sorgente: {source_folder_name}")
+    if date_tuple:
+        year = str(date_tuple[0])
+        month = f"{date_tuple[1]:02d}"
+        archive_path = f'{dest_folder}/{source_folder_name}/{year}/{month}'
+    else:
+        archive_path = f'{dest_folder}/{source_folder_name}'
+    
+    if debug:
+        print(f"DEBUG: Percorso di archiviazione: {archive_path}")
+    if not create_imap_folder(imap, archive_path, user, debug):
+        if debug:
+            print(f"DEBUG: Fallimento nella creazione della cartella {archive_path}")
+        return False
+    
+    if debug:
+        print(f"DEBUG: Tentativo di append del messaggio in {archive_path}")
+    res = imap.append(f'"{archive_path}"', '', imaplib.Time2Internaldate(time.time()), email_body)
+    if debug:
+        print(f"DEBUG: Risultato append: {res}")
+    return res[0] == 'OK'
+
+
+
+
+
+
+
+
+
 
 
 def decode_mime_words(s):
@@ -99,25 +230,28 @@ def decode_mime_words(s):
         for word, encoding in decode_header(s)
     )
 
-
-
-
 def show_grouped_subjects_and_select(filtered_msgs):
     subject_count = {}
-    for msg_id, subject in filtered_msgs:
+    for msg_id, subject, date in filtered_msgs:
         if subject not in subject_count:
-            subject_count[subject] = {'count': 0, 'ids': []}
+            subject_count[subject] = {'count': 0, 'ids': [], 'dates': []}
         subject_count[subject]['count'] += 1
         subject_count[subject]['ids'].append(msg_id)
+        subject_count[subject]['dates'].append(date)
     
     print(f"\nSoggetti dei messaggi trovati (totale: {len(filtered_msgs)}):")
     subjects_list = sorted(subject_count.items(), key=lambda x: x[1]['count'], reverse=True)
     for i, (subject, data) in enumerate(subjects_list, 1):
-        print(f"{i}. {subject} ({data['count']} messaggi)")
+        dates = sorted(data['dates'])
+        if len(dates) > 1:
+            date_info = f"dal {dates[0]} al {dates[-1]}"
+        else:
+            date_info = f"il {dates[0]}"
+        print(f"{i}. {subject} ({data['count']} messaggi) - {date_info}")
     
     selected_groups = []
     while True:
-        choice = input("\nInserisci i numeri dei gruppi da cancellare (separati da virgola), 'a' per tutti, o 'n' per nessuno: ").lower()
+        choice = input("\nInserisci i numeri dei gruppi da selezionare (separati da virgola), 'a' per tutti, o 'n' per nessuno: ").lower()
         if choice == 'n':
             break
         elif choice == 'a':
@@ -191,6 +325,9 @@ def parse_args():
                         help='Ricerca AND nell\'header specificato usando la regex fornita')
     parser.add_argument('-o', '--or-header', action='append', nargs=2, metavar=('HEADER', 'REGEX'),
                         help='Ricerca OR nell\'header specificato usando la regex fornita')
+    parser.add_argument('--archive', metavar='CARTELLA_DESTINAZIONE', help='Archivia spostandoli i messaggi nella cartella specificata')
+    parser.add_argument('--archive-to-disk', metavar='CARTELLA_LOCALE_DESTINAZIONE', help='Archivia i messaggi nella cartella locale specificata')
+    parser.add_argument('--debug', action='store_true', help='Abilita i messaggi di debug')
     return parser.parse_args()
 
 def connect_imap(server, username, password):
@@ -237,7 +374,16 @@ def get_date_range(date_range_str):
 def get_header_value(header_data, header_name):
     match = re.search(f'{header_name}: (.*)', header_data, re.IGNORECASE | re.MULTILINE)
     if match:
-        return decode_mime_words(match.group(1).strip())
+        value = decode_mime_words(match.group(1).strip())
+        if header_name.lower() == 'date':
+            try:
+                # Prova a parsare la data in un formato standard
+                parsed_date = email.utils.parsedate_to_datetime(value)
+                return parsed_date.strftime('%Y-%m-%d %H:%M:%S')
+            except:
+                # Se il parsing fallisce, restituisci la stringa originale
+                return value
+        return value
     return ''
 
 def main():
@@ -352,7 +498,7 @@ def main():
             subject = get_header_value(header_data, 'Subject')
 
             if (and_match and or_match) and (not args.regex or re.search(args.regex, subject, re.IGNORECASE)):
-                filtered_msgs.append((msg_id, subject))
+                filtered_msgs.append((msg_id, subject,get_header_value(header_data, 'Date')))
             else:
                 non_matching += 1
 
@@ -379,30 +525,54 @@ def main():
     messages_to_delete = show_grouped_subjects_and_select(filtered_msgs)
 
     if messages_to_delete:
-        confirm_delete = input(f"Vuoi procedere con la cancellazione di {len(messages_to_delete)} messaggi? (s/n): ")
-        if confirm_delete.lower() != 's':
-            print('Operazione annullata.')
-            imap.logout()
-            sys.exit(0)
+        action = "archiviazione" if args.archive or args.archive_to_disk else "cancellazione"
+    confirm_action = input(f"Vuoi procedere con l'{action} di {len(messages_to_delete)} messaggi? (s/n): ")
+    if confirm_action.lower() != 's':
+        print('Operazione annullata.')
+        imap.logout()
+        sys.exit(0)
 
-        total_msgs = len(messages_to_delete)
+    if args.archive or args.archive_to_disk:
+        archive_dest = args.archive or args.archive_to_disk
+        print(f"Archiviazione dei messaggi in {archive_dest}...")
+        for idx, msg_id in enumerate(messages_to_delete, 1):
+            if args.archive:
+                success = archive_message_imap(imap, msg_id, args.archive, args.folder, args.user, args.debug)
+            else:
+                success = archive_message_disk(msg_id, imap, args.archive_to_disk, args.folder, args.debug)
+            
+            if success:
+                if args.archive:
+                    imap.store(msg_id, '+FLAGS', r'(\Deleted)')
+                elif args.expunge:
+                    imap.store(msg_id, '+FLAGS', r'(\Deleted)')
+                else:
+                    res = imap.copy(msg_id, 'Trash')
+                    if res[0] == 'OK':
+                        imap.store(msg_id, '+FLAGS', r'(\Deleted)')
+            else:
+                print (f"messaggio id {msg_id.decode()} non trasferito.")
+             
+            if idx % 10 == 0 or idx == len(messages_to_delete):
+                print(f'{idx}/{len(messages_to_delete)} messaggi elaborati.')
+        imap.expunge()
+        print('Archiviazione completata.')
+    else:
         print('Cancellazione in corso...')
         for idx, msg_id in enumerate(messages_to_delete, 1):
             if args.expunge:
-                # Cancella definitivamente
                 imap.store(msg_id, '+FLAGS', r'(\Deleted)')
             else:
-                # Sposta nel Cestino
                 res = imap.copy(msg_id, 'Trash')
                 if res[0] == 'OK':
                     imap.store(msg_id, '+FLAGS', r'(\Deleted)')
-            if idx % 10 == 0 or idx == total_msgs:
-                print(f'{idx}/{total_msgs} messaggi elaborati.')
-
+            if idx % 10 == 0 or idx == len(messages_to_delete):
+                print(f'{idx}/{len(messages_to_delete)} messaggi elaborati.')
         imap.expunge()
         print('Cancellazione completata.')
-    else:
-        print('Nessun messaggio cancellato.')
+        total_msgs = len(messages_to_delete)
+
+        
         
     imap.logout()
 
