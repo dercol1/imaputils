@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3.11
 
 """
 IMAP Email Manager
@@ -144,16 +144,16 @@ def create_imap_folder(imap, folder_name, user, debug=False):
                 print(f"DEBUG: Verifica/creazione del percorso: {current_path}")
 
             # Verifica se la cartella esiste
-            res, folders = imap.list(f'"{current_path}"')
+            res, folders = imap.list(directory=f'"{current_path}"',pattern='*')
             if debug:
-                print(f"DEBUG: Risultato list per {current_path}: res={res}, folders={folders}")
+                print(f"DEBUG: Risultato list per {current_path}: res={res}")
 
             # Gestisci il caso in cui 'folders' è None o [None]
-            if res != 'OK' or not folders or folders == [None]:
+            if res != 'OK' or not folders or folders == [None] :
                 if debug:
                     print(f"DEBUG: La cartella {current_path} non esiste, tentativo di creazione...")
                 # Se la cartella non esiste, la creiamo
-                res, data = imap.create(f'"{current_path}"')
+                res, data = imap.create(current_path)
                 if debug:
                     print(f"DEBUG: Risultato create per {current_path}: res={res}, data={data}")
                 if res != 'OK':
@@ -162,6 +162,7 @@ def create_imap_folder(imap, folder_name, user, debug=False):
             else:
                 if debug:
                     print(f"DEBUG: La cartella {current_path} esiste già")
+                    print(f"DEBUG: {folders} {type(folders)}")
                 # Verifica se la cartella ha il flag \\HasChildren
                 # Filtra eventuali valori None in 'folders'
                 valid_folders = [folder for folder in folders if folder is not None]
@@ -176,6 +177,19 @@ def create_imap_folder(imap, folder_name, user, debug=False):
     if debug:
         print(f"DEBUG: Creazione della cartella {folder_name} completata con successo")
     return True
+
+
+def get_hierarchy_delimiter(imap):
+    result, data = imap.list()
+    if result == 'OK':
+        # Esempio di risposta: '("*" "." "")'
+        # Estrai il delimitatore di gerarchia dalla risposta
+        hierarchy_delimiter = data[0].decode().split(' ')[2].strip('"')
+        print(f"Delimitatore di gerarchia: {hierarchy_delimiter}")
+    else:
+        print("Impossibile ottenere il delimitatore di gerarchia dal server IMAP.")
+        hierarchy_delimiter = '/'
+    return hierarchy_delimiter
 
 
 def archive_message_imap(imap, msg_id, dest_folder, source_folder, user, debug=False):
@@ -207,15 +221,78 @@ def archive_message_imap(imap, msg_id, dest_folder, source_folder, user, debug=F
             print(f"DEBUG: Fallimento nella creazione della cartella {archive_path}")
         return False
     
+    # Verifica se la cartella esiste prima di tentare l'append
+    res, _ = imap.list(f'"{archive_path}"')
+    if res != 'OK':
+        print(f"Errore: La cartella {archive_path} non esiste o non è accessibile")
+        return False
+    
     if debug:
         print(f"DEBUG: Tentativo di append del messaggio in {archive_path}")
-    res = imap.append(f'"{archive_path}"', '', imaplib.Time2Internaldate(time.time()), email_body)
+    #res = imap.append(f'"{archive_path}"', '', imaplib.Time2Internaldate(time.time()), email_body)
+    res = imap.append(archive_path, '', imaplib.Time2Internaldate(time.time()), email_body)
+
     if debug:
         print(f"DEBUG: Risultato append: {res}")
     return res[0] == 'OK'
 
 
 
+def archive_message_disk(msg_id, imap, dest_folder, source_folder, debug=False):
+    if debug:
+        print(f"DEBUG: Inizio archiviazione su disco del messaggio {msg_id}")
+    
+    res, msg_data = imap.fetch(msg_id, '(RFC822)')
+    if res != 'OK':
+        print(f"Errore nel recupero del messaggio {msg_id}")
+        return False
+
+    email_body = msg_data[0][1]
+    email_message = email.message_from_bytes(email_body)
+    date_tuple = email.utils.parsedate_tz(email_message['Date'])
+    
+    if debug:
+        print(f"DEBUG: Data del messaggio: {email_message['Date']}")
+    
+    source_folder_name = os.path.basename(source_folder.strip('"'))
+    if date_tuple:
+        year = str(date_tuple[0])
+        month = f"{date_tuple[1]:02d}"
+        archive_path = os.path.join(dest_folder, source_folder_name, year, month)
+    else:
+        archive_path = os.path.join(dest_folder, source_folder_name)
+    
+    if debug:
+        print(f"DEBUG: Percorso di archiviazione: {archive_path}")
+    
+    os.makedirs(archive_path, exist_ok=True)
+    
+    subject = email_message['Subject']
+    if subject:
+        subject = decode_mime_words(subject)
+    else:
+        subject = 'No Subject'
+    
+    safe_subject = re.sub(r'[<>:"/\\|?*]', '_', subject)
+    safe_filename = f"{email_message['Date']}_{safe_subject[:50]}.eml"
+    safe_filename = safe_filename.replace(':', '_')
+    
+    file_path = os.path.join(archive_path, safe_filename)
+    
+    if debug:
+        print(f"DEBUG: Salvataggio del messaggio in: {file_path}")
+    
+    try:
+        with open(file_path, 'wb') as f:
+            f.write(email_body)
+        if debug:
+            print(f"DEBUG: Messaggio salvato con successo")
+        return True
+    except IOError as e:
+        print(f"Errore durante il salvataggio del messaggio: {e}")
+        if debug:
+            print(f"DEBUG: Errore dettagliato: {str(e)}")
+        return False
 
 
 
@@ -407,6 +484,16 @@ def main():
     if not args.folder:
         print('Devi specificare una cartella con il parametro -f.')
         sys.exit(1)
+
+    if args.debug:
+        print("hierarchy_delimiter:"+get_hierarchy_delimiter(imap))
+        result, data = imap.namespace()
+        imap.debug = 4 # Livello di debug (0-5)
+        if result == 'OK':
+            print(f"Namespace: {data}")
+            # Analizza il namespace per ottenere eventuali prefissi o delimitatori aggiuntivi
+        else:
+            print("Impossibile ottenere il namespace dal server IMAP.")
 
     folder_name = args.folder.replace('"', '') # gestisce caratteri speciali nel nome folder
     try:
