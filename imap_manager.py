@@ -18,9 +18,8 @@ Funzionalità principali:
 - Modalità di debug per la risoluzione dei problemi
 
 Autore: Diego Ercolani
-Data: 2/10/2024 ultima modifica 11/07/2025
-Versione: 1.1
-* 11/07/25 - Aggiunta funzionalità estesa per l'opzione "-l" di lista delle cartelle imap con informazioni statistiche salvate in csv e filtri
+Data: 2/10/2024 ultima modifica 2/10/2024
+Versione: 1.0
 Licenza: eredita le licenze delle librerie utilizzate, la mia parte è frutto di
          collaborazioni multiple quindi GPL
 """
@@ -51,23 +50,31 @@ Questo programma ti permette di gestire le tue email su un server IMAP. Ecco i p
 1. Elencare le cartelle IMAP disponibili:
    python imap_manager.py -u username@example.com -s imap.example.com -l
 
-2. Cercare e cancellare messaggi in una cartella specifica:
+2. Elencare cartelle con filtri (tipo, numero messaggi):
+   python imap_manager.py -u username@example.com -s imap.example.com -l --folder-type MAILBOX --message-count-min 10
+
+3. Elencare cartelle con filtri sui messaggi:
+   python imap_manager.py -u username@example.com -s imap.example.com -l --regex "spam" --filter-logic OR
+
+4. Cercare e gestire messaggi in una cartella specifica:
    python imap_manager.py -u username@example.com -s imap.example.com -f "INBOX" -d "01/01/2023-31/12/2023" "oggetto da cercare"
 
-3. Spostare i messaggi nel cestino invece di cancellarli definitivamente:
-   python imap_manager.py -u username@example.com -s imap.example.com -f "INBOX" -d "01/01/2023-31/12/2023" "oggetto da cercare"
+5. Combinare filtri con logica AND/OR:
+   python imap_manager.py -u username@example.com -s imap.example.com -f "INBOX" -a "From" "spam" -o "Subject" "offer" --filter-logic AND
 
-4. Cancellare definitivamente i messaggi (usa con cautela):
-   python imap_manager.py -u username@example.com -s imap.example.com -f "INBOX" -d "01/01/2023-31/12/2023" -e "oggetto da cercare"
-   
-5. Cercare messaggi con criteri specifici negli header:
-   python imap_manager.py -u username@example.com -s imap.example.com -f "INBOX" -a "From" "example\.com$" -o "X-Spam-Flag" "YES"
-   
-6. Archiviare i messaggi in una struttura di cartelle IMAP:
-   python imap_manager.py -u username@example.com -s imap.example.com -f "INBOX" --archive "Archive" "oggetto da cercare"
+IMPORTANTE: 
+- Con -l (list) NON sono permesse operazioni di modifica (copy, move, archive, delete)
+- Tutti i filtri sono applicabili sia in modalità list che in modalità gestione messaggi
+- I filtri possono essere combinati con logica AND (default) o OR
 
-7. Archiviare i messaggi in una struttura di cartelle locali:
-   python imap_manager.py -u username@example.com -s imap.example.com -f "INBOX" --archive-to-disk "/path/to/archive" "oggetto da cercare"
+Parametri per filtri:
+--folder-type: Tipo cartella (CONTAINER, PARENT, PARENT+MAILBOX, MAILBOX)
+--message-count-min/max/exact: Filtri per numero messaggi
+--filter-logic: Logica combinazione filtri (AND/OR)
+--regex: Filtro oggetto con espressione regolare
+-a, --and-header: Filtri AND su header specifici (può essere usato più volte)
+-o, --or-header: Filtri OR su header specifici (può essere usato più volte)
+-d, --datascope: Filtro per intervallo di date (formato: "gg/mm/aaaa-gg/mm/aaaa")
 
 Parametri:
 -u: Username per l'accesso IMAP
@@ -83,6 +90,13 @@ Parametri:
 
 --archive: Specifica la cartella IMAP di destinazione per l'archiviazione dei messaggi
 --archive-to-disk: Specifica la cartella locale di destinazione per l'archiviazione dei messaggi
+--message-count-min: Filtra cartelle con almeno N messaggi
+--message-count-max: Filtra cartelle con al massimo N messaggi  
+--message-count-exact: Filtra cartelle con esattamente N messaggi
+--folder-type: Filtra cartelle per tipo (CONTAINER, PARENT, PARENT+MAILBOX, MAILBOX)
+--copy-to-maildir: Copia i messaggi selezionati in formato MAILDIR locale
+--move-to-maildir: Sposta i messaggi selezionati in formato MAILDIR locale
+
 --debug: Abilita i messaggi di debug
 
 Per ulteriori informazioni su un parametro specifico, digita il nome del parametro (es. '-u'):
@@ -321,6 +335,291 @@ def decode_mime_words(s):
     )
 
 
+def create_maildir_structure(maildir_path, debug=False):
+    """
+    Crea la struttura MAILDIR standard (cur/, new/, tmp/)
+    """
+    if debug:
+        print(f"DEBUG: Creazione struttura MAILDIR in {maildir_path}")
+
+    try:
+        os.makedirs(maildir_path, exist_ok=True)
+        os.makedirs(os.path.join(maildir_path, 'cur'), exist_ok=True)
+        os.makedirs(os.path.join(maildir_path, 'new'), exist_ok=True)
+        os.makedirs(os.path.join(maildir_path, 'tmp'), exist_ok=True)
+
+        if debug:
+            print(f"DEBUG: Struttura MAILDIR creata con successo")
+        return True
+    except Exception as e:
+        print(f"Errore nella creazione della struttura MAILDIR: {e}")
+        return False
+
+
+def convert_imap_flags_to_maildir(imap_flags):
+    """
+    Converte i flag IMAP in suffisso MAILDIR
+    """
+    maildir_flags = []
+
+    if '\\Seen' in imap_flags:
+        maildir_flags.append('S')
+    if '\\Answered' in imap_flags:
+        maildir_flags.append('R')
+    if '\\Flagged' in imap_flags:
+        maildir_flags.append('F')
+    if '\\Draft' in imap_flags:
+        maildir_flags.append('D')
+    if '\\Deleted' in imap_flags:
+        maildir_flags.append('T')
+
+    return ''.join(sorted(maildir_flags))
+
+
+def copy_message_to_maildir(imap, msg_id, maildir_path, folder_name, debug=False):
+    """
+    Copia un singolo messaggio dalla struttura IMAP al formato MAILDIR
+    """
+    if debug:
+        print(f"DEBUG: Copia messaggio {msg_id} in MAILDIR")
+
+    try:
+        # Recupera il messaggio completo con flag
+        res, msg_data = imap.fetch(msg_id, '(RFC822 FLAGS)')
+        if res != 'OK' or not msg_data or msg_data[0] is None:
+            print(f"Errore nel recupero del messaggio {msg_id}")
+            return False
+
+        email_body = msg_data[0][1]
+
+        # Estrai i flag dal primo elemento della risposta
+        flags_response = msg_data[0][0]
+        if isinstance(flags_response, bytes):
+            flags_response = flags_response.decode('utf-8', errors='ignore')
+
+        # Cerca i flag nella risposta
+        flag_match = re.search(r'FLAGS \(([^)]*)\)', str(flags_response))
+        imap_flags = flag_match.group(1) if flag_match else ''
+
+        # Converti i flag IMAP in formato MAILDIR
+        maildir_flags = convert_imap_flags_to_maildir(imap_flags)
+
+        # Crea il nome del file MAILDIR
+        import time
+        timestamp = str(int(time.time()))
+        hostname = os.uname().nodename if hasattr(os, 'uname') else 'localhost'
+
+        # Determina la directory di destinazione (new/ per nuovi messaggi, cur/ per letti)
+        target_dir = 'cur' if '\\Seen' in imap_flags else 'new'
+
+        # Nome del file MAILDIR
+        if target_dir == 'cur' and maildir_flags:
+            filename = f"{timestamp}.{msg_id.decode()}.{hostname}:2,{maildir_flags}"
+        else:
+            filename = f"{timestamp}.{msg_id.decode()}.{hostname}"
+
+        # Crea la sottocartella se necessario
+        folder_maildir_path = os.path.join(
+            maildir_path, folder_name.replace('/', '.'))
+        if not create_maildir_structure(folder_maildir_path, debug):
+            return False
+
+        file_path = os.path.join(folder_maildir_path, target_dir, filename)
+
+        if debug:
+            print(f"DEBUG: Salvataggio in {file_path}")
+
+        # Salva il messaggio
+        with open(file_path, 'wb') as f:
+            f.write(email_body)
+
+        if debug:
+            print(
+                f"DEBUG: Messaggio salvato con successo con flag: {maildir_flags}")
+
+        return True
+
+    except Exception as e:
+        print(f"Errore durante la copia del messaggio in MAILDIR: {e}")
+        if debug:
+            print(f"DEBUG: Errore dettagliato: {str(e)}")
+        return False
+
+
+def process_messages_to_maildir_multi_folder(imap, folder_messages_dict, base_maildir_path, base_folder, move_mode=False, expunge=False, debug=False):
+    """
+    SEZIONE ELABORAZIONE MULTI-CARTELLA MAILDIR
+    Elabora messaggi da multiple cartelle mantenendo la struttura gerarchica
+    """
+    if debug:
+        total_messages = sum(len(messages)
+                             for messages in folder_messages_dict.values())
+        print(
+            f"DEBUG: Elaborazione di {total_messages} messaggi da {len(folder_messages_dict)} cartelle")
+        print(f"DEBUG: Modalità: {'SPOSTA' if move_mode else 'COPIA'}")
+
+    successful_copies = 0
+    failed_copies = 0
+    folders_created = 0
+
+    print(f"{'Spostamento' if move_mode else 'Copia'} dei messaggi in formato MAILDIR...")
+
+    for folder_name, messages in folder_messages_dict.items():
+        print(
+            f"\nElaborando cartella: {folder_name} ({len(messages)} messaggi)")
+
+        # Calcola il path relativo rispetto alla cartella base
+        if folder_name == base_folder:
+            relative_path = ""
+        else:
+            relative_path = folder_name[len(base_folder):].lstrip('/')
+
+        # Crea il percorso MAILDIR mantenendo la struttura
+        if relative_path:
+            folder_maildir_path = os.path.join(
+                base_maildir_path, relative_path.replace('/', '.'))
+        else:
+            folder_maildir_path = base_maildir_path
+
+        if debug:
+            print(
+                f"DEBUG: Percorso MAILDIR per {folder_name}: {folder_maildir_path}")
+
+        # Crea la struttura MAILDIR per questa cartella
+        if not create_maildir_structure(folder_maildir_path, debug):
+            print(
+                f"Errore nella creazione della struttura MAILDIR per {folder_name}")
+            failed_copies += len(messages)
+            continue
+
+        folders_created += 1
+        print(f"  ✓ Struttura MAILDIR creata: {folder_maildir_path}")
+
+        # Se non ci sono messaggi, continua con la prossima cartella
+        if not messages:
+            print(f"  → Cartella vuota - nessun messaggio da elaborare")
+            continue
+
+        # Seleziona la cartella corrente solo se ci sono messaggi
+        try:
+            res, data = imap.select(f'"{folder_name}"', readonly=not move_mode)
+            if res != 'OK':
+                print(f"Impossibile selezionare la cartella {folder_name}")
+                failed_copies += len(messages)
+                continue
+        except Exception as e:
+            print(f"Errore nella selezione della cartella {folder_name}: {e}")
+            failed_copies += len(messages)
+            continue
+
+        # Processa i messaggi in questa cartella
+        for idx, msg_id in enumerate(messages, 1):
+            success = copy_message_to_maildir_extended(
+                imap, msg_id, folder_maildir_path, folder_name, debug)
+
+            if success:
+                successful_copies += 1
+
+                # Se è modalità spostamento, marca il messaggio per la cancellazione
+                if move_mode:
+                    if expunge:
+                        imap.store(msg_id, '+FLAGS', r'(\Deleted)')
+                    else:
+                        # Prova a copiare nel cestino prima di eliminare
+                        try:
+                            res = imap.copy(msg_id, 'Trash')
+                            if res[0] == 'OK':
+                                imap.store(msg_id, '+FLAGS', r'(\Deleted)')
+                        except:
+                            # Se non riesce a copiare nel cestino, elimina direttamente
+                            imap.store(msg_id, '+FLAGS', r'(\Deleted)')
+            else:
+                failed_copies += 1
+
+            # Mostra progresso ogni 10 messaggi
+            if idx % 10 == 0 or idx == len(messages):
+                print(
+                    f'  {idx}/{len(messages)} messaggi elaborati per {folder_name}')
+
+        # Esegui expunge se è modalità spostamento
+        if move_mode and messages:
+            imap.expunge()
+
+    print(f"\nOperazione completata:")
+    print(f"  - Cartelle MAILDIR create: {folders_created}")
+    print(f"  - Messaggi copiati con successo: {successful_copies}")
+    if failed_copies > 0:
+        print(f"  - Messaggi falliti: {failed_copies}")
+
+    return successful_copies, failed_copies
+
+
+def copy_message_to_maildir_extended(imap, msg_id, maildir_path, folder_name, debug=False):
+    """
+    SEZIONE COPIA MESSAGGIO MAILDIR ESTESA
+    Versione estesa della funzione di copia che gestisce meglio i percorsi
+    """
+    if debug:
+        print(
+            f"DEBUG: Copia messaggio {msg_id} da {folder_name} in {maildir_path}")
+
+    try:
+        # Recupera il messaggio completo con flag
+        res, msg_data = imap.fetch(msg_id, '(RFC822 FLAGS)')
+        if res != 'OK' or not msg_data or msg_data[0] is None:
+            print(f"Errore nel recupero del messaggio {msg_id}")
+            return False
+
+        email_body = msg_data[0][1]
+
+        # Estrai i flag dal primo elemento della risposta
+        flags_response = msg_data[0][0]
+        if isinstance(flags_response, bytes):
+            flags_response = flags_response.decode('utf-8', errors='ignore')
+
+        # Cerca i flag nella risposta
+        flag_match = re.search(r'FLAGS \(([^)]*)\)', str(flags_response))
+        imap_flags = flag_match.group(1) if flag_match else ''
+
+        # Converti i flag IMAP in formato MAILDIR
+        maildir_flags = convert_imap_flags_to_maildir(imap_flags)
+
+        # Crea il nome del file MAILDIR
+        import time
+        timestamp = str(int(time.time()))
+        hostname = os.uname().nodename if hasattr(os, 'uname') else 'localhost'
+
+        # Determina la directory di destinazione (new/ per nuovi messaggi, cur/ per letti)
+        target_dir = 'cur' if '\\Seen' in imap_flags else 'new'
+
+        # Nome del file MAILDIR
+        if target_dir == 'cur' and maildir_flags:
+            filename = f"{timestamp}.{msg_id.decode()}.{hostname}:2,{maildir_flags}"
+        else:
+            filename = f"{timestamp}.{msg_id.decode()}.{hostname}"
+
+        file_path = os.path.join(maildir_path, target_dir, filename)
+
+        if debug:
+            print(f"DEBUG: Salvataggio in {file_path}")
+
+        # Salva il messaggio
+        with open(file_path, 'wb') as f:
+            f.write(email_body)
+
+        if debug:
+            print(
+                f"DEBUG: Messaggio salvato con successo con flag: {maildir_flags}")
+
+        return True
+
+    except Exception as e:
+        print(f"Errore durante la copia del messaggio in MAILDIR: {e}")
+        if debug:
+            print(f"DEBUG: Errore dettagliato: {str(e)}")
+        return False
+
+
 def show_grouped_subjects_and_select(filtered_msgs):
     subject_count = {}
     for msg_id, subject, date in filtered_msgs:
@@ -430,7 +729,365 @@ def parse_args():
                         help='Abilita i messaggi di debug')
     parser.add_argument('--no-save-csv', action='store_true',
                         help='Non salva automaticamente il CSV delle cartelle in un file')
+    parser.add_argument('--message-count-min', type=int, metavar='N',
+                        help='Filtra cartelle con almeno N messaggi')
+    parser.add_argument('--message-count-max', type=int, metavar='N',
+                        help='Filtra cartelle con al massimo N messaggi')
+    parser.add_argument('--message-count-exact', type=int, metavar='N',
+                        help='Filtra cartelle con esattamente N messaggi')
+    parser.add_argument('--folder-type', choices=['CONTAINER', 'PARENT', 'PARENT+MAILBOX', 'MAILBOX'],
+                        help='Filtra cartelle per tipo specifico')
+
+    parser.add_argument('--copy-to-maildir', metavar='PERCORSO_MAILDIR',
+                        help='Copia i messaggi selezionati in formato MAILDIR locale')
+    parser.add_argument('--move-to-maildir', metavar='PERCORSO_MAILDIR',
+                        help='Sposta i messaggi selezionati in formato MAILDIR locale')
+
+    # PARAMETRI PER LOGICA FILTRI
+    parser.add_argument('--filter-logic', choices=['AND', 'OR'], default='AND',
+                        help='Logica di combinazione dei filtri (default: AND)')
+
     return parser.parse_args()
+
+
+def validate_args(args):
+    """
+    SEZIONE VALIDAZIONE ARGOMENTI
+    Valida la compatibilità degli argomenti e rileva configurazioni non valide
+    """
+    errors = []
+
+    # REGOLA 1: Con -l non sono permesse operazioni di modifica
+    if args.list:
+        modification_options = [
+            ('--copy-to-maildir', args.copy_to_maildir),
+            ('--move-to-maildir', args.move_to_maildir),
+            ('--archive', args.archive),
+            ('--archive-to-disk', args.archive_to_disk),
+            ('--expunge', args.expunge),
+            ('regex search', args.regex)
+        ]
+
+        active_modifications = [opt for opt,
+                                value in modification_options if value]
+        if active_modifications:
+            errors.append(
+                f"Con -l (list) non sono permesse operazioni di modifica: {', '.join(active_modifications)}")
+
+    # REGOLA 2: Le opzioni di modifica richiedono una cartella specifica
+    if not args.list and not args.folder:
+        modification_options = [
+            args.copy_to_maildir, args.move_to_maildir, args.archive, args.archive_to_disk]
+        if any(modification_options) or args.regex:
+            errors.append(
+                "Le operazioni di ricerca e modifica richiedono una cartella specifica (-f)")
+
+    # REGOLA 3: Non si possono usare più opzioni di destinazione contemporaneamente
+    destination_options = [
+        ('--copy-to-maildir', args.copy_to_maildir),
+        ('--move-to-maildir', args.move_to_maildir),
+        ('--archive', args.archive),
+        ('--archive-to-disk', args.archive_to_disk)
+    ]
+
+    active_destinations = [opt for opt, value in destination_options if value]
+    if len(active_destinations) > 1:
+        errors.append(
+            f"Non è possibile usare più opzioni di destinazione contemporaneamente: {', '.join(active_destinations)}")
+
+    if errors:
+        print("ERRORI DI VALIDAZIONE:")
+        for error in errors:
+            print(f"  ❌ {error}")
+        sys.exit(1)
+
+    return True
+
+#########################################
+# Class FilterManager
+
+
+class FilterManager:
+    """
+    SEZIONE GESTIONE FILTRI
+    Gestisce tutti i tipi di filtri applicabili alle cartelle e ai messaggi
+    """
+
+    def __init__(self, args, debug=False):
+        self.args = args
+        self.debug = debug
+        self.folder_filters = []
+        self.message_filters = []
+        self.logic_mode = 'AND'  # Default: tutti i filtri devono essere soddisfatti
+
+        # Compila i filtri in base agli argomenti
+        self._compile_filters()
+
+    def _compile_filters(self):
+        """Compila tutti i filtri in base agli argomenti forniti"""
+        if self.debug:
+            print("DEBUG: Compilazione filtri in corso...")
+
+        # FILTRI PER CARTELLE
+        if self.args.folder_type:
+            self.folder_filters.append(('folder_type', self.args.folder_type))
+
+        # CORREGGI I CONTROLLI PER I FILTRI NUMERICI
+        if self.args.message_count_min is not None:
+            self.folder_filters.append(
+                ('message_count_min', self.args.message_count_min))
+
+        if self.args.message_count_max is not None:
+            self.folder_filters.append(
+                ('message_count_max', self.args.message_count_max))
+
+        if self.args.message_count_exact is not None:
+            self.folder_filters.append(
+                ('message_count_exact', self.args.message_count_exact))
+
+        # RESTO DEL CODICE rimane uguale...
+        # FILTRI PER MESSAGGI
+        if self.args.regex:
+            self.message_filters.append(
+                ('subject_regex', re.compile(self.args.regex, re.IGNORECASE)))
+
+        if self.args.and_header:
+            for header, regex in self.args.and_header:
+                self.message_filters.append(
+                    ('and_header', (header, re.compile(regex, re.IGNORECASE))))
+
+        if self.args.or_header:
+            for header, regex in self.args.or_header:
+                self.message_filters.append(
+                    ('or_header', (header, re.compile(regex, re.IGNORECASE))))
+
+        # FILTRI PER DATE
+        if self.args.datascope:
+            start_date, end_date = get_date_range(self.args.datascope)
+            self.message_filters.append(('date_range', (start_date, end_date)))
+
+        if self.debug:
+            print(
+                f"DEBUG: Filtri cartelle compilati: {len(self.folder_filters)}")
+            print(
+                f"DEBUG: Filtri messaggi compilati: {len(self.message_filters)}")
+
+    def apply_folder_filters(self, folder_info, flag_counts):
+        """
+        Applica i filtri a una cartella specifica
+        Returns: True se la cartella passa tutti i filtri, False altrimenti
+        """
+        folder_name = folder_info['name']
+        folder_type = folder_info['type']
+
+        for filter_type, filter_value in self.folder_filters:
+            if filter_type == 'folder_type':
+                if folder_type != filter_value:
+                    if self.debug:
+                        print(
+                            f"DEBUG: Cartella {folder_name} esclusa per tipo: {folder_type} != {filter_value}")
+                    return False
+
+            elif filter_type == 'message_count_min':
+                msg_count = flag_counts.get('TOTAL', 0)
+                if isinstance(msg_count, int) and msg_count < filter_value:
+                    if self.debug:
+                        print(
+                            f"DEBUG: Cartella {folder_name} esclusa per min count: {msg_count} < {filter_value}")
+                    return False
+
+            elif filter_type == 'message_count_max':
+                msg_count = flag_counts.get('TOTAL', 0)
+                if isinstance(msg_count, int) and msg_count > filter_value:
+                    if self.debug:
+                        print(
+                            f"DEBUG: Cartella {folder_name} esclusa per max count: {msg_count} > {filter_value}")
+                    return False
+
+            elif filter_type == 'message_count_exact':
+                msg_count = flag_counts.get('TOTAL', 0)
+                if isinstance(msg_count, int) and msg_count != filter_value:
+                    if self.debug:
+                        print(
+                            f"DEBUG: Cartella {folder_name} esclusa per exact count: {msg_count} != {filter_value}")
+                    return False
+
+        return True
+
+    def apply_message_filters(self, header_data, message_date=None):
+        """
+        Applica i filtri a un messaggio specifico
+        Returns: True se il messaggio passa tutti i filtri, False altrimenti
+        """
+        and_results = []
+        or_results = []
+        general_results = []
+
+        for filter_type, filter_value in self.message_filters:
+            if filter_type == 'subject_regex':
+                subject = get_header_value(header_data, 'Subject')
+                match = filter_value.search(subject)
+                general_results.append(bool(match))
+
+            elif filter_type == 'and_header':
+                header_name, regex = filter_value
+                header_value = get_header_value(header_data, header_name)
+                match = regex.search(header_value)
+                and_results.append(bool(match))
+
+            elif filter_type == 'or_header':
+                header_name, regex = filter_value
+                header_value = get_header_value(header_data, header_name)
+                match = regex.search(header_value)
+                or_results.append(bool(match))
+
+            elif filter_type == 'date_range':
+                # SKIP IL FILTRO DATE SE È GIÀ STATO APPLICATO NELLA RICERCA IMAP
+                if self.debug:
+                    print(
+                        f"DEBUG: Saltando filtro date - già applicato in ricerca IMAP")
+
+                continue
+
+                # CODICE NON ESEGUITO (FALLBACK Just In CASE) - da rimuovere visto che la ricerca è già stata fatta in IMAP
+                start_date, end_date = filter_value
+                if message_date:
+                    try:
+                        if isinstance(message_date, str):
+                            parsed_date = email.utils.parsedate_to_datetime(
+                                message_date)
+                        else:
+                            parsed_date = message_date
+
+                        if parsed_date.tzinfo is None:
+                            parsed_date = parsed_date.replace(
+                                tzinfo=timezone.utc)
+
+                        # Converti le date di confronto in timezone-aware se necessario
+                        if start_date.tzinfo is None:
+                            start_date = start_date.replace(
+                                tzinfo=timezone.utc)
+                        if end_date.tzinfo is None:
+                            end_date = end_date.replace(tzinfo=timezone.utc)
+
+                        date_match = start_date <= parsed_date <= end_date
+                        general_results.append(date_match)
+                    except Exception as e:
+                        if self.debug:
+                            print(f"DEBUG: Errore parsing data: {e}")
+                        general_results.append(False)
+                else:
+                    general_results.append(False)
+
+        # LOGICA DI COMBINAZIONE DEI FILTRI
+        # AND: tutti i filtri AND devono essere True
+        and_passed = all(and_results) if and_results else True
+
+        # OR: almeno uno dei filtri OR deve essere True
+        or_passed = any(or_results) if or_results else True
+
+        # GENERAL: tutti i filtri generali devono essere True
+        general_passed = all(general_results) if general_results else True
+
+        # Risultato finale: AND + OR + GENERAL
+        final_result = and_passed and or_passed and general_passed
+
+        if self.debug:
+            print(
+                f"DEBUG: Filtri messaggio - AND: {and_passed}, OR: {or_passed}, GENERAL: {general_passed}, FINALE: {final_result}")
+
+        return final_result
+
+    def has_message_filters(self):
+        """Verifica se ci sono filtri per messaggi attivi"""
+        return len(self.message_filters) > 0
+
+    def has_folder_filters(self):
+        """Verifica se ci sono filtri per cartelle attivi"""
+        return len(self.folder_filters) > 0
+
+    def get_active_filters_description(self):
+        """Restituisce una descrizione dei filtri attivi"""
+        descriptions = []
+
+        for filter_type, filter_value in self.folder_filters:
+            if filter_type == 'folder_type':
+                descriptions.append(f"Tipo cartella: {filter_value}")
+            elif filter_type == 'message_count_min':
+                descriptions.append(f"Min messaggi: {filter_value}")
+            elif filter_type == 'message_count_max':
+                descriptions.append(f"Max messaggi: {filter_value}")
+            elif filter_type == 'message_count_exact':
+                descriptions.append(f"Esatto messaggi: {filter_value}")
+
+        for filter_type, filter_value in self.message_filters:
+            if filter_type == 'subject_regex':
+                descriptions.append(f"Regex oggetto: '{filter_value.pattern}'")
+            elif filter_type == 'and_header':
+                header_name, regex = filter_value
+                descriptions.append(f"AND {header_name}: '{regex.pattern}'")
+            elif filter_type == 'or_header':
+                header_name, regex = filter_value
+                descriptions.append(f"OR {header_name}: '{regex.pattern}'")
+            elif filter_type == 'date_range':
+                start_date, end_date = filter_value
+                descriptions.append(
+                    f"Date: {start_date.strftime('%d/%m/%Y')}-{end_date.strftime('%d/%m/%Y')}")
+
+        return descriptions
+
+# /CLASS FilterManager
+#############################################################
+
+
+def find_subfolders(imap, base_folder, debug=False):
+    """
+    SEZIONE RICERCA SOTTOCARTELLE
+    Trova tutte le sottocartelle di una cartella base
+    """
+    if debug:
+        print(f"DEBUG: Ricerca sottocartelle per {base_folder}")
+
+    try:
+        # Ottieni tutte le cartelle
+        result, folders = imap.list()
+        if result != 'OK':
+            print('Impossibile recuperare le cartelle.')
+            return []
+
+        subfolders = []
+        base_folder = base_folder.strip('"')
+
+        for folder in folders:
+            # Parsing del nome della cartella
+            parts = folder.decode().split(' "/" ')
+            if len(parts) == 2:
+                folder_name = parts[1].strip('"')
+                folder_flags = parts[0].strip('()').split()
+            else:
+                folder_decoded = folder.decode()
+                folder_name = folder_decoded.split(
+                    '"')[-2] if '"' in folder_decoded else folder_decoded
+                folder_flags = []
+
+            # Controlla se la cartella è una sottocartella
+            if folder_name == base_folder or folder_name.startswith(base_folder + '/'):
+                subfolders.append({
+                    'name': folder_name,
+                    'flags': folder_flags,
+                    'full_folder_data': folder
+                })
+                if debug:
+                    print(f"DEBUG: Trovata sottocartella: {folder_name}")
+
+        if debug:
+            print(f"DEBUG: Trovate {len(subfolders)} sottocartelle")
+
+        return subfolders
+
+    except Exception as e:
+        print(f"Errore nella ricerca delle sottocartelle: {e}")
+        return []
 
 
 def connect_imap(server, username, password):
@@ -495,18 +1152,26 @@ def get_message_counts_by_flags(imap, folder_name):
 
 
 def list_folders(imap, args=None):
+    """
+    SEZIONE ELENCO CARTELLE
+    Elenca le cartelle IMAP applicando tutti i filtri specificati
+    """
     import csv
     import sys
     import time
     from io import StringIO
     from email.parser import Parser
 
+    # INIZIALIZZAZIONE FILTER MANAGER
+    filter_manager = FilterManager(
+        args, args.debug if args else False) if args else None
+
     result, folders = imap.list()
     if result != 'OK':
         print('Impossibile recuperare le cartelle.')
         return
 
-    # AGGIUNTA: Filtra le cartelle se è specificato un filtro
+    # FILTRO PER CARTELLA SPECIFICA (se specificata)
     if args and args.folder:
         filtered_folders = []
         filter_folder = args.folder.strip('"')
@@ -532,7 +1197,7 @@ def list_folders(imap, args=None):
                 f'Nessuna cartella trovata che corrisponde al filtro: {filter_folder}')
             return
 
-    # Prepara i criteri di ricerca se specificati
+    # PREPARAZIONE CRITERI DI RICERCA
     search_criteria = []
     if args and args.datascope:
         start_date, end_date = get_date_range(args.datascope)
@@ -630,23 +1295,33 @@ def list_folders(imap, args=None):
 
         # Tronca il nome della cartella se troppo lungo
         display_name = folder_name if len(
-            folder_name) <= 40 else folder_name[:37] + "..."
+            folder_name) <= 40 else "..." + folder_name[-37:]
         print(
             f"\rScansione: {folder_idx}/{len(folders)} - {display_name}: {msg_count} msg{eta_str}", end='', flush=True)
 
     print(f"\n\nTotale messaggi da elaborare: {total_messages_to_process}")
-    print("\nElenco cartelle trovate:")
-    for info in folder_info:
-        print(
-            f"  {info['estimated_msgs']:>6} msg - {info['name']} ({info['type']})")
+    # MOSTRA I FILTRI ATTIVI
+    if filter_manager:
+        active_filters = filter_manager.get_active_filters_description()
+        if active_filters:
+            print("🔍 FILTRI ATTIVI:")
+            for filter_desc in active_filters:
+                print(f"   - {filter_desc}")
+            print(f"   → Logica filtri: {args.filter_logic}")
+            print(
+                f"   → Solo le cartelle/messaggi che rispettano i filtri verranno mostrati\n")
+        else:
+            print("ℹ️  Nessun filtro attivo - verranno mostrate tutte le cartelle\n")
 
     print(f"\nFase 2: Elaborazione dettagliata...")
 
-    # MOSTRA I FILTRI ATTIVI
-    active_filters = []
-    command_line_parts = []
+    # PREPARAZIONE DATI CSV
+    csv_data = []
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
     # Ricostruisci la command line
+    command_line_parts = []
+
     if args:
         command_line_parts.append(f"imap_manager.py")
         command_line_parts.append(f"-u {args.user}")
@@ -659,75 +1334,42 @@ def list_folders(imap, args=None):
             command_line_parts.append(f'"{args.regex}"')
         if args.datascope:
             command_line_parts.append(f"-d {args.datascope}")
-        if args.expunge:
-            command_line_parts.append("-e")
         if args.debug:
             command_line_parts.append("--debug")
+        if args.filter_logic != 'AND':
+            command_line_parts.append(f"--filter-logic {args.filter_logic}")
         if args.no_save_csv:
             command_line_parts.append("--no-save-csv")
 
     command_line = " ".join(command_line_parts)
 
-    # Aggiungi tutti i filtri attivi
-    if args and args.folder:
-        active_filters.append(f"Filtro cartella: '{args.folder}'")
-    if args and args.regex:
-        active_filters.append(f"Regex oggetto: '{args.regex}'")
-    if args and args.datascope:
-        active_filters.append(f"Intervallo date: {args.datascope}")
-    if and_headers:
-        for header, regex in and_headers:
-            active_filters.append(f"AND {header}: '{regex}'")
-    if or_headers:
-        for header, regex in or_headers:
-            active_filters.append(f"OR {header}: '{regex}'")
-
-    if active_filters:
-        print("🔍 FILTRI ATTIVI:")
-        for filter_desc in active_filters:
-            print(f"   - {filter_desc}")
-        print(f"   → Solo i messaggi che rispettano TUTTI i filtri verranno mostrati nei risultati\n")
-    else:
-        print("ℹ️  Nessun filtro attivo - verranno mostrati tutti i messaggi\n")
-
-    # SECONDA FASE: Elaborazione dettagliata con ETA ottimizzato
-    csv_data = []
-
-    # AGGIUNGI: Righe di intestazione con informazioni sui filtri e comando
+    # Intestazioni CSV
     csv_data.append(
-        [f"# IMAP Manager Report - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"])
+        [f"# IMAP Manager Report - {timestamp}"])
     csv_data.append([f"# Command: {command_line}"])
     csv_data.append([f"# Server: {args.server}"])
     csv_data.append([f"# User: {args.user}"])
-    if active_filters:
-        csv_data.append([f"# Filtri attivi: {len(active_filters)}"])
-        for filter_desc in active_filters:
-            csv_data.append([f"# - {filter_desc}"])
-    else:
-        csv_data.append([f"# Nessun filtro attivo"])
 
-    # Stampa le informazioni sui filtri e l'header CSV
-    for row in csv_data:
-        if len(row) == 1 and row[0].startswith('#'):
-            print(f"# {row[0][2:]}")  # Stampa i commenti senza il prefisso #
-        elif len(row) == 13:  # È la riga dell'header
-            print(','.join(row))
-            break
+    if filter_manager:
+        active_filters = filter_manager.get_active_filters_description()
+        if active_filters:
+            csv_data.append([f"# Filtri attivi: {len(active_filters)}"])
+            for filter_desc in active_filters:
+                csv_data.append([f"# - {filter_desc}"])
+        else:
+            csv_data.append([f"# Nessun filtro attivo"])
 
     csv_data.append(['Folder', 'Total_Messages', 'Seen', 'Unseen', 'Answered', 'Flagged',
                      'Deleted', 'Draft', 'Recent', 'Oldest_Date', 'Newest_Date', 'Size_Bytes', 'Type'])
 
-    # Variabili per ETA a campione ogni 500 messaggi
-    processed_messages = 0
-    processed_folders = 0
-    start_time = time.time()
-    current_eta = None
-    last_eta_calculation = 0
-    ETA_SAMPLE_INTERVAL = 500  # Calcola ETA ogni 500 messaggi
-    eta_history = []  # Storico per media mobile
-
     # Stampa l'header CSV
     print('Folder,Total_Messages,Seen,Unseen,Answered,Flagged,Deleted,Draft,Recent,Oldest_Date,Newest_Date,Size_Bytes,Type')
+
+    # ELABORAZIONE DETTAGLIATA
+    processed_messages = 0
+    start_time = time.time()
+    folders_processed = 0
+    folders_included = 0
 
     for folder_idx, info in enumerate(folder_info, 1):
         folder_name = info['name']
@@ -735,425 +1377,163 @@ def list_folders(imap, args=None):
         folder_type = info['type']
         estimated_msgs = info['estimated_msgs']
 
-        # Calcola ETA per le cartelle
-        if folder_idx > 1:
-            current_time = time.time()
-            elapsed = current_time - start_time
-            avg_time_per_folder = elapsed / (folder_idx - 1)
-            remaining_folders = len(folder_info) - folder_idx
-            folder_eta_seconds = remaining_folders * avg_time_per_folder
-            folder_eta_str = f" - ETA cartelle: {folder_eta_seconds/60:.1f}m" if folder_eta_seconds > 60 else f" - ETA: {folder_eta_seconds:.1f}s"
-        else:
-            folder_eta_str = ""
-
-        # Mostra progresso cartelle
-        display_name = folder_name if len(
-            folder_name) <= 30 else folder_name[:27] + "..."
-        filter_suffix = " (FILTRATO)" if (
-            (args and args.regex) or and_headers or or_headers) else ""
-        print(
-            f"\rElaborando cartella {folder_idx}/{len(folder_info)}: {display_name} ({estimated_msgs} msg{filter_suffix}){folder_eta_str}", end='', flush=True)
-
-        # Ottieni sempre i conteggi per flag, indipendentemente dal tipo di cartella
+        # Ottieni sempre i conteggi per flag
         flag_counts = get_message_counts_by_flags(imap, folder_name)
 
         # Determina il tipo di cartella basato sui flag
         if '\\Noselect' in folder_flags:
-            # Cartella che non può contenere messaggi, solo sottocartelle
             folder_type = "CONTAINER"
         elif '\\HasChildren' in folder_flags and flag_counts.get('TOTAL', 0) == 0:
-            # Cartella con sottocartelle ma senza messaggi
             folder_type = "PARENT"
         elif '\\HasChildren' in folder_flags and flag_counts.get('TOTAL', 0) > 0:
-            # Cartella con sottocartelle E messaggi
             folder_type = "PARENT+MAILBOX"
         else:
-            # Cartella normale con messaggi
             folder_type = "MAILBOX"
 
-        # Inizializza valori di default prima dell'elaborazione
+        # Aggiorna info del folder
+        info['type'] = folder_type
+
+        # APPLICA FILTRI PER CARTELLE
+        if filter_manager and filter_manager.has_folder_filters():
+            if not filter_manager.apply_folder_filters(info, flag_counts):
+                continue  # Salta questa cartella
+
+        folders_processed += 1
         msg_count = flag_counts.get('TOTAL', 0)
         oldest_date = "N/A"
         newest_date = "N/A"
         folder_size = "N/A"
 
-        # Solo se ci sono messaggi da elaborare, procedi con l'analisi dettagliata
-        if msg_count > 0:
-            # INIZIALIZZA SEMPRE filtered_msg_ids
-            filtered_msg_ids = []
+        # Se ci sono filtri per messaggi, elabora i messaggi singolarmente
+        if filter_manager and filter_manager.has_message_filters() and msg_count > 0:
+            filtered_flag_counts = {
+                'SEEN': 0, 'UNSEEN': 0, 'ANSWERED': 0, 'FLAGGED': 0,
+                'DELETED': 0, 'DRAFT': 0, 'RECENT': 0, 'TOTAL': 0
+            }
 
             try:
                 select_result, select_data = imap.select(
                     f'"{folder_name}"', readonly=True)
                 if select_result == 'OK':
-                    # Usa la ricerca con i criteri specificati (se presenti)
                     res, messages = imap.search(None, search_command)
                     if res == 'OK' and messages[0]:
                         msg_ids = messages[0].split()
-                    else:
-                        msg_ids = []
 
-                    if msg_ids:
-                        # Solo se ci sono criteri di filtro aggiuntivi, elabora i messaggi singolarmente
-                        if (args and args.regex) or and_headers or or_headers:
-                            # Elaborazione con filtri
-                            total_size = 0
-                            dates = []
+                        total_size = 0
+                        dates = []
 
-                            # AGGIUNGI: Contatori per i flag dei messaggi filtrati
-                            filtered_flag_counts = {
-                                'SEEN': 0,
-                                'UNSEEN': 0,
-                                'ANSWERED': 0,
-                                'FLAGGED': 0,
-                                'DELETED': 0,
-                                'DRAFT': 0,
-                                'RECENT': 0
-                            }
+                        for msg_idx, msg_id in enumerate(msg_ids, 1):
+                            try:
+                                # Mostra progresso
+                                if msg_idx % 100 == 0:
+                                    print(
+                                        f"\rElaborando {folder_name}: {msg_idx}/{len(msg_ids)} messaggi", end='', flush=True)
 
-                            # Elaborazione dettagliata dei messaggi con filtri
-                            for msg_idx, msg_id in enumerate(msg_ids, 1):
-                                try:
-                                    # Aggiorna il progresso ogni 100 messaggi
-                                    if processed_messages % 100 == 0:
-                                        if processed_messages >= last_eta_calculation + ETA_SAMPLE_INTERVAL:
-                                            current_time = time.time()
-                                            elapsed = current_time - start_time
-                                            if processed_messages > 0:
-                                                avg_time_per_msg = elapsed / processed_messages
-                                                remaining_msgs = total_messages_to_process - processed_messages
-                                                eta_seconds = remaining_msgs * avg_time_per_msg
-
-                                                # Media mobile per ETA più stabile
-                                                eta_history.append(eta_seconds)
-                                                if len(eta_history) > 5:
-                                                    eta_history.pop(0)
-                                                current_eta = sum(
-                                                    eta_history) / len(eta_history)
-
-                                                last_eta_calculation = processed_messages
-
-                                            eta_str = f" - ETA: {current_eta/60:.1f}m" if current_eta else ""
-                                            print(
-                                                f"\rElaborando {folder_name}: {msg_idx}/{len(msg_ids)} ({processed_messages}/{total_messages_to_process}){eta_str}", end='', flush=True)
-
-                                    # MODIFICA: Recupera header, dimensione E flag del messaggio
-                                    res, msg_data = imap.fetch(
-                                        msg_id, '(RFC822.HEADER RFC822.SIZE FLAGS)')
-                                    if res != 'OK' or not msg_data or msg_data[0] is None:
-                                        processed_messages += 1
-                                        continue
-
-                                    # DEBUG: Stampa la struttura della risposta IMAP (solo per i primi 3 messaggi)
-                                    if args and args.debug and msg_idx <= 3:
-                                        print(
-                                            f"\nDEBUG: Struttura completa msg_data per {msg_id}:")
-                                        print(f"  - Tipo: {type(msg_data)}")
-                                        print(
-                                            f"  - Lunghezza: {len(msg_data)}")
-                                        for i, item in enumerate(msg_data):
-                                            print(
-                                                f"  - msg_data[{i}]: {type(item)} - {str(item)[:200]}...")
-
-                                    header_data = msg_data[0][1]
-                                    if header_data is None:
-                                        processed_messages += 1
-                                        continue
-
-                                    try:
-                                        header_data = header_data.decode(
-                                            'utf-8', errors='ignore')
-                                    except AttributeError:
-                                        processed_messages += 1
-                                        continue
-
-                                    # Verifica le condizioni AND
-                                    and_match = all(re.search(regex, get_header_value(header_data, header), re.IGNORECASE)
-                                                    for header, regex in and_headers) if and_headers else True
-
-                                    # Verifica le condizioni OR
-                                    or_match = any(re.search(regex, get_header_value(header_data, header), re.IGNORECASE)
-                                                   for header, regex in or_headers) if or_headers else True
-
-                                    # Verifica il subject con regex
-                                    subject = get_header_value(
-                                        header_data, 'Subject')
-                                    regex_match = not args.regex or re.search(
-                                        args.regex, subject, re.IGNORECASE)
-
-                                    # Se il messaggio corrisponde ai criteri
-                                    if and_match and or_match and regex_match:
-                                        filtered_msg_ids.append(msg_id)
-
-                                        # AGGIUNGI: Estrai e conta i flag del messaggio filtrato
-                                        try:
-                                            # I flag si trovano nella risposta del fetch
-                                            if msg_data and msg_data[0] and len(msg_data[0]) > 0:
-                                                response_line = msg_data[0][0]
-                                                if isinstance(response_line, bytes):
-                                                    response_line = response_line.decode(
-                                                        'utf-8', errors='ignore')
-                                                else:
-                                                    response_line = str(
-                                                        response_line)
-
-                                                # Cerca i flag nella risposta (FLAGS (\Seen \Answered ...))
-                                                flag_match = re.search(
-                                                    r'FLAGS \(([^)]*)\)', response_line)
-                                                if flag_match:
-                                                    flags_str = flag_match.group(
-                                                        1)
-                                                    if args and args.debug and msg_idx <= 10:
-                                                        print(
-                                                            f"\nDEBUG: Messaggio {msg_id} flag: {flags_str}")
-
-                                                    # Conta i flag
-                                                    if '\\Seen' in flags_str:
-                                                        filtered_flag_counts['SEEN'] += 1
-                                                    else:
-                                                        filtered_flag_counts['UNSEEN'] += 1
-
-                                                    if '\\Answered' in flags_str:
-                                                        filtered_flag_counts['ANSWERED'] += 1
-
-                                                    if '\\Flagged' in flags_str:
-                                                        filtered_flag_counts['FLAGGED'] += 1
-
-                                                    if '\\Deleted' in flags_str:
-                                                        filtered_flag_counts['DELETED'] += 1
-
-                                                    if '\\Draft' in flags_str:
-                                                        filtered_flag_counts['DRAFT'] += 1
-
-                                                    if '\\Recent' in flags_str:
-                                                        filtered_flag_counts['RECENT'] += 1
-                                                else:
-                                                    # Se non troviamo i flag, assumiamo che sia non letto
-                                                    filtered_flag_counts['UNSEEN'] += 1
-                                                    if args and args.debug and msg_idx <= 10:
-                                                        print(
-                                                            f"\nDEBUG: Messaggio {msg_id} - flag non trovati nella risposta")
-
-                                        except Exception as e:
-                                            if args and args.debug:
-                                                print(
-                                                    f"\nDEBUG: Errore estrazione flag per {msg_id}: {str(e)}")
-                                            # Fallback: conta come non letto
-                                            filtered_flag_counts['UNSEEN'] += 1
-
-                                        # Calcola la dimensione del messaggio dalla risposta IMAP
-                                        try:
-                                            # La dimensione è nella prima parte della risposta come stringa
-                                            if msg_data and msg_data[0] and len(msg_data[0]) > 0:
-                                                response_line = msg_data[0][0]
-                                                if isinstance(response_line, bytes):
-                                                    response_line = response_line.decode(
-                                                        'utf-8', errors='ignore')
-                                                else:
-                                                    response_line = str(
-                                                        response_line)
-
-                                                # Cerca RFC822.SIZE nella stringa di risposta
-                                                size_match = re.search(
-                                                    r'RFC822\.SIZE (\d+)', response_line)
-                                                if size_match:
-                                                    message_size = int(
-                                                        size_match.group(1))
-                                                    total_size += message_size
-                                                    if args and args.debug and msg_idx <= 10:
-                                                        print(
-                                                            f"\nDEBUG: Messaggio {msg_id} dimensione: {message_size} bytes")
-                                                else:
-                                                    # Fallback: usa la lunghezza dell'header
-                                                    total_size += len(header_data)
-                                                    if args and args.debug and msg_idx <= 10:
-                                                        print(
-                                                            f"\nDEBUG: Messaggio {msg_id} - RFC822.SIZE non trovato, usando lunghezza header: {len(header_data)} bytes")
-                                            else:
-                                                # Fallback: usa la lunghezza dell'header
-                                                total_size += len(header_data)
-                                                if args and args.debug and msg_idx <= 10:
-                                                    print(
-                                                        f"\nDEBUG: Messaggio {msg_id} - Risposta IMAP vuota, usando lunghezza header: {len(header_data)} bytes")
-
-                                        except Exception as e:
-                                            if args and args.debug:
-                                                print(
-                                                    f"\nDEBUG: Errore calcolo dimensione per {msg_id}: {str(e)}")
-                                            total_size += len(header_data)
-
-                                        # Estrai la data del messaggio dal header originale
-                                        try:
-                                            # Cerca la data direttamente nell'header invece di usare get_header_value
-                                            date_match = re.search(
-                                                r'Date: (.*)', header_data, re.IGNORECASE | re.MULTILINE)
-                                            if date_match:
-                                                raw_date_str = date_match.group(
-                                                    1).strip()
-                                                # Rimuovi eventuali commenti dalle date (testo tra parentesi)
-                                                raw_date_str = re.sub(
-                                                    r'\s*\(.*?\)\s*', '', raw_date_str)
-                                                try:
-                                                    parsed_date = email.utils.parsedate_to_datetime(
-                                                        raw_date_str)
-                                                    if parsed_date.tzinfo is None:
-                                                        parsed_date = parsed_date.replace(
-                                                            tzinfo=timezone.utc)
-                                                    dates.append(parsed_date)
-                                                except Exception as parse_error:
-                                                    if args and args.debug:
-                                                        print(
-                                                            f"\nDEBUG: Errore parsing data '{raw_date_str}': {str(parse_error)}")
-                                        except Exception as e:
-                                            if args and args.debug:
-                                                print(
-                                                    f"\nDEBUG: Errore estrazione data per {msg_id}: {str(e)}")
-
-                                    processed_messages += 1
-
-                                except Exception as e:
-                                    if args and args.debug:
-                                        print(
-                                            f"\nDEBUG: Errore nell'elaborazione del messaggio {msg_id}: {str(e)}")
-                                    processed_messages += 1
+                                res, msg_data = imap.fetch(
+                                    msg_id, '(RFC822.HEADER RFC822.SIZE FLAGS)')
+                                if res != 'OK' or not msg_data or msg_data[0] is None:
                                     continue
 
-                            # AGGIORNA LE INFORMAZIONI SOLO SE CI SONO MESSAGGI FILTRATI
-                            if filtered_msg_ids:
-                                folder_size = total_size
-                                # Calcola le date per i messaggi filtrati
-                                if dates:
-                                    dates.sort()
-                                    oldest_date = dates[0].strftime('%Y-%m-%d')
-                                    newest_date = dates[-1].strftime(
-                                        '%Y-%m-%d')
-                                else:
-                                    oldest_date = "N/A"
-                                    newest_date = "N/A"
+                                header_data = msg_data[0][1]
+                                if header_data is None:
+                                    continue
 
-                                # AGGIORNA: Usa i conteggi dei flag filtrati invece di flag_counts
-                                flag_counts = filtered_flag_counts.copy()
-                                flag_counts['TOTAL'] = len(filtered_msg_ids)
+                                try:
+                                    header_data = header_data.decode(
+                                        'utf-8', errors='ignore')
+                                except AttributeError:
+                                    continue
 
+                                # Applica filtri messaggio
+                                if filter_manager.apply_message_filters(header_data):
+                                    filtered_flag_counts['TOTAL'] += 1
+
+                                    # Estrai e conta i flag
+                                    if msg_data and msg_data[0] and len(msg_data[0]) > 0:
+                                        response_line = msg_data[0][0]
+                                        if isinstance(response_line, bytes):
+                                            response_line = response_line.decode(
+                                                'utf-8', errors='ignore')
+                                        else:
+                                            response_line = str(response_line)
+
+                                        flag_match = re.search(
+                                            r'FLAGS \(([^)]*)\)', response_line)
+                                        if flag_match:
+                                            flags_str = flag_match.group(1)
+
+                                            if '\\Seen' in flags_str:
+                                                filtered_flag_counts['SEEN'] += 1
+                                            else:
+                                                filtered_flag_counts['UNSEEN'] += 1
+
+                                            if '\\Answered' in flags_str:
+                                                filtered_flag_counts['ANSWERED'] += 1
+                                            if '\\Flagged' in flags_str:
+                                                filtered_flag_counts['FLAGGED'] += 1
+                                            if '\\Deleted' in flags_str:
+                                                filtered_flag_counts['DELETED'] += 1
+                                            if '\\Draft' in flags_str:
+                                                filtered_flag_counts['DRAFT'] += 1
+                                            if '\\Recent' in flags_str:
+                                                filtered_flag_counts['RECENT'] += 1
+                                        else:
+                                            filtered_flag_counts['UNSEEN'] += 1
+
+                                        # Calcola dimensione
+                                        size_match = re.search(
+                                            r'RFC822\.SIZE (\d+)', response_line)
+                                        if size_match:
+                                            message_size = int(
+                                                size_match.group(1))
+                                            total_size += message_size
+
+                                    # Estrai data
+                                    try:
+                                        date_match = re.search(
+                                            r'Date: (.*)', header_data, re.IGNORECASE | re.MULTILINE)
+                                        if date_match:
+                                            raw_date_str = date_match.group(
+                                                1).strip()
+                                            raw_date_str = re.sub(
+                                                r'\s*\(.*?\)\s*', '', raw_date_str)
+                                            parsed_date = email.utils.parsedate_to_datetime(
+                                                raw_date_str)
+                                            if parsed_date.tzinfo is None:
+                                                parsed_date = parsed_date.replace(
+                                                    tzinfo=timezone.utc)
+                                            dates.append(parsed_date)
+                                    except:
+                                        pass
+
+                                processed_messages += 1
+
+                            except Exception as e:
                                 if args and args.debug:
                                     print(
-                                        f"\nDEBUG: Cartella {folder_name} - Messaggi filtrati: {len(filtered_msg_ids)}")
-                                    print(
-                                        f"DEBUG: Dimensione totale: {folder_size} bytes")
-                                    print(
-                                        f"DEBUG: Date: {oldest_date} - {newest_date}")
-                                    print(f"DEBUG: Flag counts: {flag_counts}")
-                            else:
-                                # Nessun messaggio corrisponde ai filtri
-                                folder_size = 0
-                                oldest_date = "N/A"
-                                newest_date = "N/A"
-                                # Azzera tutti i conteggi per i flag
-                                flag_counts = {
-                                    flag: 0 for flag in flag_counts.keys()}
-                                flag_counts['TOTAL'] = 0
-                        else:
-                            # Se non ci sono filtri aggiuntivi, usa tutti i messaggi
-                            filtered_msg_ids = msg_ids
+                                        f"\nDEBUG: Errore elaborazione messaggio {msg_id}: {str(e)}")
+                                continue
 
-                            # Calcola le date dei messaggi estremi
-                            print(
-                                f"\rElaborando {folder_name}: analisi rapida di {len(msg_ids)} messaggi...", end='', flush=True)
-                            try:
-                                # Ottieni il primo e ultimo messaggio per le date
-                                first_msg = imap.fetch(
-                                    msg_ids[0], '(RFC822.HEADER)')
-                                last_msg = imap.fetch(
-                                    msg_ids[-1], '(RFC822.HEADER)')
+                        # Aggiorna i conteggi con i risultati filtrati
+                        flag_counts = filtered_flag_counts
+                        folder_size = total_size
 
-                                dates = []
-                                for msg_data in [first_msg, last_msg]:
-                                    if msg_data[0] == 'OK' and msg_data[1] and msg_data[1][0]:
-                                        try:
-                                            header_data = msg_data[1][0][1].decode(
-                                                'utf-8', errors='ignore')
-                                            parser = Parser()
-                                            parsed_headers = parser.parsestr(
-                                                header_data)
-                                            date_header = parsed_headers.get(
-                                                'Date')
-                                            if date_header:
-                                                parsed_date = email.utils.parsedate_to_datetime(
-                                                    date_header)
-                                                if parsed_date.tzinfo is None:
-                                                    parsed_date = parsed_date.replace(
-                                                        tzinfo=timezone.utc)
-                                                dates.append(parsed_date)
-                                        except:
-                                            pass
-
-                                if dates:
-                                    dates.sort()
-                                    oldest_date = dates[0].strftime('%Y-%m-%d')
-                                    newest_date = dates[-1].strftime(
-                                        '%Y-%m-%d')
-
-                                # Calcola la dimensione totale (approssimativa)
-                                try:
-                                    # Campiona alcuni messaggi per stimare la dimensione media
-                                    sample_size = min(10, len(msg_ids))
-                                    sample_msgs = msg_ids[:sample_size]
-                                    total_sample_size = 0
-
-                                    for sample_idx, msg_id in enumerate(sample_msgs, 1):
-                                        print(
-                                            f"\rElaborando {folder_name}: campionamento {sample_idx}/{sample_size}...", end='', flush=True)
-                                        size_data = imap.fetch(
-                                            msg_id, '(RFC822.SIZE)')
-                                        if size_data[0] == 'OK':
-                                            size_match = re.search(
-                                                r'RFC822.SIZE (\d+)', str(size_data[1][0]))
-                                            if size_match:
-                                                total_sample_size += int(
-                                                    size_match.group(1))
-
-                                    if total_sample_size > 0:
-                                        avg_size = total_sample_size / sample_size
-                                        folder_size = int(
-                                            avg_size * len(msg_ids))
-                                except:
-                                    folder_size = "N/A"
-
-                                # Aggiorna il contatore dei messaggi processati
-                                processed_messages += msg_count
-
-                            except:
-                                oldest_date = "N/A"
-                                newest_date = "N/A"
-                                folder_size = "N/A"
-                    else:
-                        # Nessun messaggio trovato
-                        filtered_msg_ids = []
-
-                else:
-                    # Se non si riesce a selezionare, prova con STATUS
-                    filtered_msg_ids = []
-                    try:
-                        status_result, status_data = imap.status(
-                            f'"{folder_name}"', '(MESSAGES)')
-                        if status_result == 'OK' and status_data:
-                            status_str = status_data[0].decode()
-                            match = re.search(r'MESSAGES (\d+)', status_str)
-                            if match:
-                                msg_count = int(match.group(1))
-                                # Aggiorna anche flag_counts se necessario
-                                flag_counts['TOTAL'] = msg_count
-                    except:
-                        pass
+                        if dates:
+                            dates.sort()
+                            oldest_date = dates[0].strftime('%Y-%m-%d')
+                            newest_date = dates[-1].strftime('%Y-%m-%d')
 
             except Exception as e:
-                filtered_msg_ids = []
                 if args and args.debug:
                     print(
-                        f"\nDEBUG: Errore nell'elaborazione della cartella {folder_name}: {str(e)}")
-        else:
-            # Se non ci sono messaggi, inizializza filtered_msg_ids come lista vuota
-            filtered_msg_ids = []
+                        f"\nDEBUG: Errore elaborazione cartella {folder_name}: {str(e)}")
+
+        # Solo includere cartelle che hanno messaggi (se ci sono filtri per messaggi)
+        if filter_manager and filter_manager.has_message_filters():
+            if flag_counts.get('TOTAL', 0) == 0:
+                continue  # Salta cartelle senza messaggi che passano i filtri
+
+        folders_included += 1
 
         # Prepara i dati per il CSV
         folder_data = [
@@ -1173,26 +1553,22 @@ def list_folders(imap, args=None):
         ]
 
         # Pulisci la linea di progresso e stampa la riga CSV
-        print(f'\r{" " * 120}', end='')  # Pulisce la linea
+        print(f'\r{" " * 120}', end='')
         csv_line = ','.join(str(x) for x in folder_data)
         print(f'\r{csv_line}')
 
-        # Aggiungi ai dati CSV
         csv_data.append(folder_data)
-        processed_folders += 1
 
     # Stampa le statistiche finali
     total_time = time.time() - start_time
-    if active_filters:
-        print(f'\n📊 RISULTATI FILTRATI:')
-        print(f'   - Cartelle elaborate: {len(folder_info)}')
-        print(f'   - Messaggi totali scansionati: {total_messages_to_process}')
+    print(f'\n📊 RISULTATI:')
+    print(f'   - Cartelle elaborate: {folders_processed}')
+    print(f'   - Cartelle incluse nei risultati: {folders_included}')
+    if filter_manager and filter_manager.has_message_filters():
+        print(f'   - Messaggi totali processati: {processed_messages}')
         print(
-            f'   - Messaggi che rispettano i filtri: {sum(row[1] for row in csv_data if len(row) == 13 and row[0] != "Folder" and isinstance(row[1], int))}')
-        print(f'   - Tempo elaborazione: {total_time:.1f} secondi')
-    else:
-        print(
-            f'\nElaborazione completata in {total_time:.1f} secondi - {len(folder_info)} cartelle elaborate, {processed_messages} messaggi processati')
+            f'   - Messaggi che rispettano i filtri: {sum(row[1] for row in csv_data if len(row) == 13 and isinstance(row[1], int))}')
+    print(f'   - Tempo elaborazione: {total_time:.1f} secondi')
 
     # Salvataggio automatico del CSV (se non disabilitato)
     if not (args and args.no_save_csv):
@@ -1205,23 +1581,8 @@ def list_folders(imap, args=None):
         try:
             with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
                 writer = csv.writer(csvfile)
-
-                # Scrivi le righe di intestazione (commenti)
                 for row in csv_data:
-                    if len(row) == 1 and row[0].startswith('#'):
-                        writer.writerow(row)
-                    elif len(row) == 0:  # Riga vuota
-                        writer.writerow([''])
-                    elif len(row) == 13:  # Header o dati
-                        writer.writerow(row)
-                        break
-
-                # Scrivi i dati delle cartelle (salta le righe di intestazione)
-                data_rows = [row for row in csv_data if len(
-                    row) == 13 and row[0] != 'Folder']
-                for row in data_rows:
                     writer.writerow(row)
-
             print(f'Dati salvati in: {filename}')
         except Exception as e:
             print(f'Errore nel salvataggio del file CSV: {e}')
@@ -1256,23 +1617,29 @@ def get_header_value(header_data, header_name):
 
 
 def main():
+    """
+    SEZIONE PRINCIPALE
+    Coordina l'esecuzione di tutte le funzionalità del programma
+    """
 
     # Parse arguments
     args = parse_args()
 
+    # VALIDAZIONE ARGOMENTI
+    validate_args(args)
+
     if not args.password:
         args.password = getpass.getpass('Inserisci la password: ')
 
-    and_headers = args.and_header or []
-    or_headers = args.or_header or []
-
     imap = connect_imap(args.server, args.user, args.password)
 
+    # MODALITÀ ELENCO CARTELLE
     if args.list:
         list_folders(imap, args)
         imap.logout()
         sys.exit(0)
 
+    # MODALITÀ GESTIONE MESSAGGI
     if not args.folder:
         print('Devi specificare una cartella con il parametro -f.')
         sys.exit(1)
@@ -1287,29 +1654,24 @@ def main():
         else:
             print("Impossibile ottenere il namespace dal server IMAP.")
 
-    # gestisce caratteri speciali nel nome folder
-    folder_name = args.folder.replace('"', '')
-    try:
-        res, data = imap.select(folder_name)
-    except imaplib.IMAP4.error as e:
-        print(f'Errore nella selezione della cartella: {e}')
-        print('Provo a utilizzare il nome della cartella tra virgolette...')
-        try:
-            res, data = imap.select(f'"{folder_name}"')
-        except imaplib.IMAP4.error as e:
-            print(f'Errore nella selezione della cartella: {e}')
-            print('Impossibile selezionare la cartella. Verificare il nome e i permessi.')
-            imap.logout()
-            sys.exit(1)
+    # SEZIONE RICERCA RICORSIVA SOTTOCARTELLE
+    base_folder = args.folder.replace('"', '')
+    subfolders = find_subfolders(imap, base_folder, args.debug)
 
-    if res != 'OK':
-        print(f'Impossibile selezionare la cartella "{folder_name}".')
-        print(f'Errore: {data[0].decode()}')
+    if not subfolders:
+        print(f'Nessuna cartella trovata per il percorso: {base_folder}')
         imap.logout()
         sys.exit(1)
 
-    search_criteria = []
+    print(f"Trovate {len(subfolders)} cartelle da elaborare:")
+    for subfolder in subfolders:
+        print(f"  - {subfolder['name']}")
 
+    # INIZIALIZZAZIONE FILTER MANAGER
+    filter_manager = FilterManager(args, args.debug)
+
+    # PREPARAZIONE CRITERI DI RICERCA
+    search_criteria = []
     if args.datascope:
         start_date, end_date = get_date_range(args.datascope)
         start_str = start_date.strftime('%d-%b-%Y')
@@ -1317,109 +1679,228 @@ def main():
         search_criteria.append(f'SINCE {start_str}')
         search_criteria.append(f'BEFORE {end_str}')
 
-    if args.regex:
-        pass  # Il filtro per la regex sarà applicato successivamente
-
-    # Costruisce la stringa di ricerca per il comando SEARCH
     search_command = 'ALL'
     if search_criteria:
         search_command = ' '.join(search_criteria)
 
-    res, messages = imap.search(None, search_command)
-    if res != 'OK':
-        print('Errore nella ricerca dei messaggi.')
-        imap.logout()
-        sys.exit(1)
+    # RICERCA MESSAGGI IN TUTTE LE SOTTOCARTELLE
+    folder_messages_dict = {}
+    total_messages_found = 0
+    folders_matching_filters = []  # NUOVO: traccia cartelle che soddisfano filtri
 
-    msg_ids = messages[0].split()
+    print("Ricerca dei messaggi in corso...")
 
-    print('Ricerca dei messaggi in corso...')
-    total_msgs = len(msg_ids)
-    filtered_msgs = []
-    non_matching = 0
+    for subfolder in subfolders:
+        folder_name = subfolder['name']
+        folder_flags = subfolder['flags']
 
-    for idx, msg_id in enumerate(msg_ids, 1):
+        # Determina il tipo di cartella
+        if '\\Noselect' in folder_flags:
+            folder_type = "CONTAINER"
+        elif '\\HasChildren' in folder_flags:
+            folder_type = "PARENT"
+        else:
+            folder_type = "MAILBOX"
+
+        # Applica filtri per cartelle se attivi
+        folder_matches_filters = True
+        if filter_manager.has_folder_filters():
+            flag_counts = get_message_counts_by_flags(imap, folder_name)
+
+            # Raffina il tipo di cartella
+            if folder_type == "PARENT":
+                if flag_counts.get('TOTAL', 0) > 0:
+                    folder_type = "PARENT+MAILBOX"
+
+            folder_info = {
+                'name': folder_name,
+                'type': folder_type,
+                'flags': folder_flags
+            }
+
+            if not filter_manager.apply_folder_filters(folder_info, flag_counts):
+                folder_matches_filters = False
+                if args.debug:
+                    print(f"DEBUG: Cartella {folder_name} esclusa dai filtri")
+                continue
+
+        # Salta cartelle container che non possono contenere messaggi
+        if '\\Noselect' in folder_flags:
+            if args.debug:
+                print(f"DEBUG: Saltando cartella container: {folder_name}")
+            continue
+
+        # NUOVO: Aggiungi cartella che soddisfa i filtri
+        if folder_matches_filters:
+            folders_matching_filters.append(folder_name)
+
         try:
-            res, msg_data = imap.fetch(msg_id, '(RFC822.HEADER)')
-            if res != 'OK' or not msg_data or msg_data[0] is None:
-                print(
-                    f"\nWarning: Impossibile recuperare l'header completo per il messaggio ID {msg_id.decode()} (Indice: {idx}/{total_msgs})")
-                # Tentiamo di recuperare gli header disponibili
-                try:
-                    res, msg_data = imap.fetch(
-                        msg_id, '(BODY[HEADER.FIELDS (FROM TO SUBJECT DATE)])')
-                    if res == 'OK' and msg_data and msg_data[0] is not None:
-                        print("Header disponibili:")
-                        header_data = msg_data[0][1].decode(
-                            'utf-8', errors='ignore')
-                        print(header_data)
-                    else:
-                        print("Impossibile recuperare gli header di base.")
-                except Exception as e:
+            # Seleziona la cartella
+            res, data = imap.select(f'"{folder_name}"', readonly=True)
+            if res != 'OK':
+                print(f"Impossibile selezionare la cartella {folder_name}")
+                continue
+
+            # Cerca messaggi
+            res, messages = imap.search(None, search_command)
+            if res != 'OK':
+                print(f"Errore nella ricerca dei messaggi in {folder_name}")
+                continue
+
+            msg_ids = messages[0].split()
+            if not msg_ids:
+                if args.debug:
+                    print(f"DEBUG: Nessun messaggio trovato in {folder_name}")
+                # NUOVO: Anche se non ci sono messaggi, aggiungi la cartella vuota
+                if folder_matches_filters:
+                    folder_messages_dict[folder_name] = []
+                continue
+
+            print(f"Trovati {len(msg_ids)} messaggi in {folder_name}")
+
+            # Applica filtri sui messaggi se attivi
+            if filter_manager.has_message_filters():
+                filtered_msg_ids = []
+
+                # CONTROLLA SE CI SONO FILTRI PER DATE - SE SI, SALTA IL FILTRO DATE
+                # PERCHÉ GIÀ APPLICATO NELLA RICERCA IMAP
+                has_date_filter = any(
+                    filter_type == 'date_range' for filter_type, _ in filter_manager.message_filters)
+
+                if args.debug:
                     print(
-                        f"Errore nel tentativo di recuperare gli header di base: {str(e)}")
-                continue
+                        f"DEBUG: Applicazione filtri messaggio per {folder_name}")
+                    print(
+                        f"DEBUG: Filtri date già applicati in IMAP: {has_date_filter}")
+                    print(f"DEBUG: Messaggi da filtrare: {len(msg_ids)}")
 
-            header_data = msg_data[0][1]
-            if header_data is None:
+                for msg_id in msg_ids:
+                    try:
+                        res, msg_data = imap.fetch(msg_id, '(RFC822.HEADER)')
+                        if res != 'OK' or not msg_data or msg_data[0] is None:
+                            continue
+
+                        header_data = msg_data[0][1]
+                        if header_data is None:
+                            continue
+
+                        try:
+                            header_data = header_data.decode(
+                                'utf-8', errors='ignore')
+                        except AttributeError:
+                            continue
+
+                        # ESTRAI LA DATA DAL HEADER PER PASSARLA AI FILTRI
+                        message_date = None
+                        if not has_date_filter:  # Solo se non c'è già un filtro date applicato
+                            date_match = re.search(
+                                r'Date: (.*)', header_data, re.IGNORECASE | re.MULTILINE)
+                            if date_match:
+                                try:
+                                    raw_date_str = date_match.group(1).strip()
+                                    raw_date_str = re.sub(
+                                        r'\s*\(.*?\)\s*', '', raw_date_str)
+                                    message_date = email.utils.parsedate_to_datetime(
+                                        raw_date_str)
+                                except:
+                                    message_date = None
+
+                        # APPLICA FILTRI MESSAGGIO CON LA DATA
+                        if filter_manager.apply_message_filters(header_data, message_date):
+                            filtered_msg_ids.append(msg_id)
+                            if args.debug:
+                                print(
+                                    f"DEBUG: Messaggio {msg_id.decode()} passa i filtri")
+                        else:
+                            if args.debug:
+                                print(
+                                    f"DEBUG: Messaggio {msg_id.decode()} non passa i filtri")
+
+                    except Exception as e:
+                        if args.debug:
+                            print(
+                                f"DEBUG: Errore elaborazione messaggio {msg_id}: {e}")
+                        continue
+
+                msg_ids = filtered_msg_ids
                 print(
-                    f"\nWarning: Dati dell'header mancanti per il messaggio ID {msg_id}")
-                continue
+                    f"Messaggi che rispettano i filtri in {folder_name}: {len(msg_ids)}")
 
-            try:
-                header_data = header_data.decode('utf-8', errors='ignore')
-            except AttributeError:
-                print(
-                    f"\nWarning: Dati dell'header mancanti per il messaggio ID {msg_id.decode()} (Indice: {idx}/{total_msgs})")
-                continue
-
-            # Verifica le condizioni AND
-            and_match = all(re.search(regex, get_header_value(header_data, header), re.IGNORECASE)
-                            for header, regex in and_headers)
-
-            # Verifica le condizioni OR
-            or_match = any(re.search(regex, get_header_value(header_data, header), re.IGNORECASE)
-                           for header, regex in or_headers) if or_headers else True
-
-            subject = get_header_value(header_data, 'Subject')
-
-            if (and_match and or_match) and (not args.regex or re.search(args.regex, subject, re.IGNORECASE)):
-                filtered_msgs.append(
-                    (msg_id, subject, get_header_value(header_data, 'Date')))
-            else:
-                non_matching += 1
+            if folder_matches_filters:
+                folder_messages_dict[folder_name] = msg_ids
+                total_messages_found += len(msg_ids)
 
         except Exception as e:
             print(
-                f"\nErrore durante l'elaborazione del messaggio ID {msg_id.decode()} (Indice: {idx}/{total_msgs}): {str(e)}")
+                f"Errore nell'elaborazione della cartella {folder_name}: {e}")
             continue
 
-        # Aggiorna la barra di avanzamento
-        matching = len(filtered_msgs)
-        progress_bar = create_progress_bar(
-            total_msgs, idx, matching, non_matching)
-        print(f'\r{progress_bar}', end='', flush=True)
-        # Fine ciclo for
+    # NUOVO: Controlla se ci sono cartelle che soddisfano i filtri
+    print(f'\nTotale messaggi trovati: {total_messages_found}')
+    print(f'Cartelle che soddisfano i filtri: {len(folders_matching_filters)}')
 
-    print('\n')  # Nuova linea dopo la barra di avanzamento
-    num_msgs = len(filtered_msgs)
-    print(f'Numero di messaggi trovati: {num_msgs}')
-
-    if num_msgs == 0:
-        print('Nessun messaggio corrisponde ai criteri di ricerca.')
+    if len(folders_matching_filters) == 0:
+        print('Nessuna cartella soddisfa i criteri di ricerca.')
         imap.logout()
         sys.exit(0)
 
-    messages_to_delete = show_grouped_subjects_and_select(filtered_msgs)
+    # MOSTRA RIEPILOGO MESSAGGI PER CARTELLA
+    print("\nRiepilogo cartelle e messaggi:")
+    for folder_name in folders_matching_filters:
+        msg_count = len(folder_messages_dict.get(folder_name, []))
+        print(f"  - {folder_name}: {msg_count} messaggi")
 
-    if messages_to_delete:
-        action = "archiviazione" if args.archive or args.archive_to_disk else "cancellazione"
+    # GESTIONE OPZIONI MAILDIR
+    if args.copy_to_maildir or args.move_to_maildir:
+        maildir_path = args.copy_to_maildir or args.move_to_maildir
+        move_mode = bool(args.move_to_maildir)
+
+        if not create_maildir_structure(maildir_path, args.debug):
+            print("Errore nella creazione della struttura MAILDIR")
+            imap.logout()
+            sys.exit(1)
+
+        action = "spostamento" if move_mode else "copia"
+        total_folders = len(folders_matching_filters)
+
+        print(
+            f"\nLa {action} creerà strutture MAILDIR per {total_folders} cartelle:")
+        for folder_name in folders_matching_filters:
+            msg_count = len(folder_messages_dict.get(folder_name, []))
+            print(f"  - {folder_name} → {msg_count} messaggi")
+
         confirm_action = input(
-            f"Vuoi procedere con l'{action} di {len(messages_to_delete)} messaggi? (s/n): ")
+            f"\nVuoi procedere con la {action} di {total_folders} cartelle (totale {total_messages_found} messaggi)? (s/n): ")
+
         if confirm_action.lower() != 's':
             print('Operazione annullata.')
             imap.logout()
             sys.exit(0)
+
+        successful, failed = process_messages_to_maildir_multi_folder(
+            imap, folder_messages_dict, maildir_path, base_folder,
+            move_mode, args.expunge, args.debug
+        )
+
+        print(
+            f"Operazione MAILDIR completata: {successful} messaggi elaborati con successo")
+        if failed > 0:
+            print(
+                f"Attenzione: {failed} messaggi non sono stati elaborati correttamente")
+
+        # NUOVO: Mostra struttura creata
+        print(f"\nStruttura MAILDIR creata in: {maildir_path}")
+        for folder_name in folders_matching_filters:
+            relative_path = folder_name[len(base_folder):].lstrip('/')
+            if relative_path:
+                folder_path = os.path.join(
+                    maildir_path, relative_path.replace('/', '.'))
+            else:
+                folder_path = maildir_path
+            print(f"  - {folder_path}")
+
+        imap.logout()
+        sys.exit(0)
 
     if args.archive or args.archive_to_disk:
         archive_dest = args.archive or args.archive_to_disk

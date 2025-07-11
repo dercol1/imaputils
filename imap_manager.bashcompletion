@@ -1,0 +1,257 @@
+#!/usr/bin/env bash
+# File: imap_manager-completion.bash
+# Bash completion for imap_manager.py script
+# 
+# Installazione:
+# 1. Copia questo file in ~/.local/share/bash-completion/completions/imap_manager.py
+# 2. Oppure in /etc/bash_completion.d/imap_manager.py (richiede root)
+# 3. Oppure source questo file nel tuo ~/.bashrc
+#
+# Utilizzo:
+# source imap_manager-completion.bash
+
+_imap_manager_completion()
+{
+    local cur prev opts
+    COMPREPLY=()
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+    
+    # Opzioni principali del comando
+    opts="--help -l --list -f --folder -s --server -u --user -p --password 
+          -d --datascope -e --expunge -a --and-header -o --or-header 
+          --archive --archive-to-disk --debug --no-save-csv 
+          --message-count-min --message-count-max --message-count-exact 
+          --folder-type --copy-to-maildir --move-to-maildir --filter-logic"
+    
+    # Gestione delle opzioni che richiedono valori specifici
+    case "${prev}" in
+        --folder-type)
+            # Valori possibili per folder-type
+            local folder_types="CONTAINER PARENT PARENT+MAILBOX MAILBOX"
+            COMPREPLY=($(compgen -W "${folder_types}" -- ${cur}))
+            return 0
+            ;;
+        --filter-logic)
+            # Valori possibili per filter-logic
+            local logic_types="AND OR"
+            COMPREPLY=($(compgen -W "${logic_types}" -- ${cur}))
+            return 0
+            ;;
+        -s|--server)
+            # Suggerimenti comuni per server IMAP
+            local common_servers="imap.gmail.com:993 imap.outlook.com:993 
+                                 imap.yahoo.com:993 imap.aol.com:993
+                                 mail.google.com:993 outlook.office365.com:993"
+            COMPREPLY=($(compgen -W "${common_servers}" -- ${cur}))
+            return 0
+            ;;
+        -u|--user)
+            # Non completare username per sicurezza, ma mostra formato
+            if [[ ${#cur} -eq 0 ]]; then
+                COMPREPLY=("username@domain.com")
+            fi
+            return 0
+            ;;
+        -p|--password)
+            # Non completare password per sicurezza
+            COMPREPLY=()
+            return 0
+            ;;
+        -f|--folder)
+            # Suggerimenti comuni per cartelle IMAP
+            local common_folders="INBOX \"Sent Items\" \"Sent Messages\" Drafts 
+                                 Trash Spam Junk Archive \"Deleted Items\""
+            COMPREPLY=($(compgen -W "${common_folders}" -- ${cur}))
+            return 0
+            ;;
+        -d|--datascope)
+            # Suggerimenti per formato data
+            if [[ ${#cur} -eq 0 ]]; then
+                local current_year=$(date +%Y)
+                local current_month=$(date +%m)
+                local current_day=$(date +%d)
+                local date_examples="01/01/${current_year}-31/12/${current_year} 
+                                   01/${current_month}/${current_year}-${current_day}/${current_month}/${current_year}
+                                   01/01/2023-31/12/2023"
+                COMPREPLY=($(compgen -W "${date_examples}" -- ${cur}))
+            fi
+            return 0
+            ;;
+        --archive)
+            # Suggerimenti per cartelle di archivio
+            local archive_folders="Archive \"Archive/$(date +%Y)\" 
+                                  \"Archive/$(date +%Y)/$(date +%m)\" 
+                                  \"Old Messages\""
+            COMPREPLY=($(compgen -W "${archive_folders}" -- ${cur}))
+            return 0
+            ;;
+        --archive-to-disk|--copy-to-maildir|--move-to-maildir)
+            # Completamento directory
+            COMPREPLY=($(compgen -d -- ${cur}))
+            return 0
+            ;;
+        --message-count-min|--message-count-max|--message-count-exact)
+            # Suggerimenti numerici comuni
+            local count_suggestions="0 1 10 50 100 500 1000"
+            COMPREPLY=($(compgen -W "${count_suggestions}" -- ${cur}))
+            return 0
+            ;;
+        -a|--and-header|-o|--or-header)
+            # Per questi parametri, il prossimo argomento dovrebbe essere un header
+            # Controlla se stiamo completando il nome dell'header o la regex
+            local word_count=${#COMP_WORDS[@]}
+            local looking_for_header=true
+            
+            # Controlla se l'opzione precedente era -a/-o e se abbiamo già un header
+            if [[ $word_count -gt 2 ]]; then
+                local prev_prev="${COMP_WORDS[COMP_CWORD-2]}"
+                if [[ "$prev_prev" == "-a" || "$prev_prev" == "--and-header" || 
+                      "$prev_prev" == "-o" || "$prev_prev" == "--or-header" ]]; then
+                    looking_for_header=false
+                fi
+            fi
+            
+            if [[ $looking_for_header == true ]]; then
+                # Completamento per nome header
+                local common_headers="From To Subject Date Message-ID Reply-To 
+                                     Cc Bcc Content-Type X-Mailer User-Agent"
+                COMPREPLY=($(compgen -W "${common_headers}" -- ${cur}))
+            else
+                # Completamento per regex - alcuni pattern comuni
+                local common_patterns="\".*spam.*\" \".*@domain\\.com\" 
+                                     \".*urgent.*\" \".*[Nn]o-?[Rr]eply.*\""
+                COMPREPLY=($(compgen -W "${common_patterns}" -- ${cur}))
+            fi
+            return 0
+            ;;
+    esac
+    
+    # Gestione del completamento generale
+    if [[ ${cur} == -* ]]; then
+        # Completamento delle opzioni
+        COMPREPLY=($(compgen -W "${opts}" -- ${cur}))
+        return 0
+    else
+        # Gestione argomenti posizionali (regex)
+        # Verifica se siamo in una posizione dove ci aspettiamo una regex
+        local has_folder=false
+        local has_list=false
+        local i=1
+        
+        while [[ $i -lt ${#COMP_WORDS[@]} ]]; do
+            case "${COMP_WORDS[$i]}" in
+                -f|--folder)
+                    has_folder=true
+                    ((i++)) # Salta il valore della cartella
+                    ;;
+                -l|--list)
+                    has_list=true
+                    ;;
+                -a|--and-header|-o|--or-header)
+                    ((i+=2)) # Salta header e regex
+                    ;;
+                -*)
+                    # Altre opzioni che potrebbero avere un valore
+                    if [[ "${COMP_WORDS[$i]}" =~ ^(-s|--server|-u|--user|-p|--password|-d|--datascope|--archive|--archive-to-disk|--copy-to-maildir|--move-to-maildir|--message-count-min|--message-count-max|--message-count-exact|--folder-type|--filter-logic)$ ]]; then
+                        ((i++)) # Salta il valore dell'opzione
+                    fi
+                    ;;
+            esac
+            ((i++))
+        done
+        
+        # Se abbiamo una cartella ma non -l, potremmo aspettarci una regex
+        if [[ $has_folder == true && $has_list == false ]]; then
+            # Suggerimenti per regex comuni
+            local common_regex="\".*spam.*\" \".*[Uu]nsubscribe.*\" 
+                              \".*[Pp]romotion.*\" \".*[Aa]dvert.*\"
+                              \".*[Nn]ewsletter.*\" \".*[Ff]ree.*\""
+            COMPREPLY=($(compgen -W "${common_regex}" -- ${cur}))
+        fi
+        
+        return 0
+    fi
+}
+
+# Funzione di utilità per ottenere la lista delle cartelle IMAP
+# (opzionale, per completamento avanzato)
+_get_imap_folders()
+{
+    local server="$1"
+    local user="$2"
+    local password="$3"
+    
+    # Questa funzione potrebbe essere implementata per ottenere
+    # dinamicamente le cartelle dal server IMAP, ma richiede
+    # credenziali e potrebbe essere lenta
+    # Per ora restituiamo cartelle comuni
+    echo "INBOX \"Sent Items\" \"Sent Messages\" Drafts Trash Spam Junk Archive"
+}
+
+# Funzione di help interattiva
+_imap_manager_help()
+{
+    cat << 'EOF'
+IMAP Manager - Bash Completion Help
+
+Questo script fornisce completamento automatico per imap_manager.py.
+
+Esempi di utilizzo:
+  imap_manager.py -u <TAB>              # Suggerisce formato username
+  imap_manager.py -s <TAB>              # Suggerisce server IMAP comuni
+  imap_manager.py --folder-type <TAB>   # Mostra tipi cartella disponibili
+  imap_manager.py -f <TAB>              # Suggerisce cartelle comuni
+  imap_manager.py -d <TAB>              # Suggerisce formati data
+  imap_manager.py -a <TAB>              # Suggerisce header comuni
+  
+Opzioni supportate:
+  -l, --list                    Elenca cartelle
+  -f, --folder                  Specifica cartella
+  -s, --server                  Server IMAP
+  -u, --user                    Username
+  -p, --password                Password
+  -d, --datascope               Intervallo date
+  -e, --expunge                 Cancella definitivamente
+  -a, --and-header              Filtro AND su header
+  -o, --or-header               Filtro OR su header
+  --archive                     Archivia in cartella IMAP
+  --archive-to-disk             Archivia su disco
+  --copy-to-maildir            Copia in MAILDIR
+  --move-to-maildir            Sposta in MAILDIR
+  --folder-type                 Tipo cartella
+  --filter-logic                Logica filtri
+  --message-count-min           Minimo messaggi
+  --message-count-max           Massimo messaggi
+  --message-count-exact         Esatto messaggi
+  --debug                       Modalità debug
+  --no-save-csv                 Non salvare CSV
+  --help                        Mostra aiuto
+
+Per installare permanentemente:
+  sudo cp imap_manager-completion.bash /etc/bash_completion.d/imap_manager.py
+  
+Per installare per utente corrente:
+  mkdir -p ~/.local/share/bash-completion/completions
+  cp imap_manager-completion.bash ~/.local/share/bash-completion/completions/imap_manager.py
+EOF
+}
+
+# Registra la funzione di completamento
+complete -F _imap_manager_completion imap_manager.py
+
+# Registra anche per il caso in cui lo script sia chiamato senza estensione
+complete -F _imap_manager_completion imap_manager
+
+# Alias per la funzione di help
+alias imap_manager_completion_help='_imap_manager_help'
+
+# Messaggio di installazione (mostrato solo quando source manualmente)
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    echo "Bash completion per imap_manager.py caricato!"
+    echo "Utilizza 'imap_manager_completion_help' per vedere la guida."
+    echo ""
+    echo "Per installazione permanente:"
+    echo "  mkdir -p ~/.local/share/bash-completion/completions"
+    echo "  cp ${BASH_SOURCE[0]} ~/.local/share/bash-completion/completions/imap_manager.py"
+fi
